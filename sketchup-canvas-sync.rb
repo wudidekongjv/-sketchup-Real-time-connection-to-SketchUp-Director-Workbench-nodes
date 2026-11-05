@@ -7,6 +7,7 @@
 # ============================================================
 
 require 'sketchup.rb'
+require 'extensions.rb'
 require 'socket'
 require 'json'
 require 'base64'
@@ -300,4 +301,15 @@ module SketchUpCanvasSync
     }
     file_loaded(__FILE__)
   end
+end
+
+# ── 标准扩展注册（SketchUp 2026 要求）──
+unless defined?(SketchUpCanvasSync::REGISTERED)
+  extension = SketchupExtension.new('CanvasSync', __FILE__)
+  extension.description = 'SketchUp 与 Infinite Canvas 实时联动（相机同步 + 截图）'
+  extension.version     = '0.1.0'
+  extension.creator     = 'CanvasSync'
+  extension.copyright   = '2026'
+  Sketchup.register_extension(extension, true)
+  SketchUpCanvasSync::REGISTERED = true
 end
