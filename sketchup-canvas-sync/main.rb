@@ -293,10 +293,10 @@ module SketchUpCanvasSync
     end
   end
 
-  # ── 菜单 ──
+  # ── 菜单（注意：UI.menu 需要英文菜单名 'Plugins'，SketchUp 会自动显示为「扩展程序」）──
   unless file_loaded?(__FILE__)
-    menu = UI.menu('扩展程序')
-    menu.add_item('CanvasSync：启动/停止同步服务') { toggle }
+    menu = UI.menu('Plugins').add_submenu('CanvasSync')
+    menu.add_item('启动/停止同步服务') { toggle }
     file_loaded(__FILE__)
   end
 end
