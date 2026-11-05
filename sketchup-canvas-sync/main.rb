@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 # CanvasSync 实际逻辑 —— 由主文件 sketchup-canvas-sync.rb 加载。
+# 通信：本地 WebSocket 服务（127.0.0.1:8899），带完整帧缓冲与状态机。
 
 require 'sketchup.rb'
 require 'socket'
@@ -11,9 +12,10 @@ require 'thread'
 module SketchUpCanvasSync
   HOST = '127.0.0.1'
   PORT = 8899
+  WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
   @server = nil
-  @clients = []
+  @clients = []          # 每个 client 附带 @rbuf（读缓冲）
   @mutex = Mutex.new
   @running = false
   @timer_id = nil
@@ -44,7 +46,7 @@ module SketchUpCanvasSync
       UI.stop_timer(@timer_id) if @timer_id
       @timer_id = nil
       @mutex.synchronize do
-        @clients.each { |c| c.close rescue nil }
+        @clients.each { |c| c[:socket].close rescue nil }
         @clients.clear
       end
       @server.close rescue nil
@@ -56,90 +58,112 @@ module SketchUpCanvasSync
       running? ? stop : start
     end
 
-    # ── 主循环 ──
+    # ── 主循环（50ms 一次）──
     def tick
       return unless @running
       accept_clients
-      read_messages
+      read_clients
     end
 
     def accept_clients
       return unless @server
       loop do
-        begin
-          client = @server.accept_nonblock
+        sock = begin
+          @server.accept_nonblock
         rescue IO::WaitReadable, Errno::EAGAIN, Errno::EWOULDBLOCK
           break
         rescue => e
           break
         end
-        client.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
-        @mutex.synchronize { @clients << client }
-        puts "[CanvasSync] 客户端连接：#{client.peeraddr[3]}"
+        sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+        @mutex.synchronize do
+          @clients << { socket: sock, rbuf: ''.b, handshaken: false }
+        end
+        puts "[CanvasSync] TCP 客户端连接：#{sock.peeraddr[3]}"
       end
     end
 
-    def read_messages
+    def read_clients
       @mutex.synchronize do
-        @clients.each do |client|
+        @clients.each do |c|
+          sock = c[:socket]
           begin
-            data = client.read_nonblock(65536)
-            handle_data(client, data)
+            chunk = sock.read_nonblock(65536)
+            c[:rbuf] << chunk.b
+            process_buffer(c)
           rescue IO::WaitReadable, Errno::EAGAIN, Errno::EWOULDBLOCK
             # 暂无数据
           rescue => e
-            remove_client(client)
+            remove_client(c)
           end
         end
       end
     end
 
-    def handle_data(client, data)
-      if data.include?('Sec-WebSocket-Key')
-        do_handshake(client, data)
-      else
-        parse_frames(client, data)
+    # 处理某个连接的读缓冲：先握手，后解析帧。
+    def process_buffer(c)
+      sock = c[:socket]
+      # 1) 未握手：等待完整的 HTTP 请求头（\r\n\r\n 结尾）。
+      unless c[:handshaken]
+        idx = c[:rbuf].index("\r\n\r\n")
+        return unless idx
+        header = c[:rbuf][0, idx + 4]
+        c[:rbuf] = c[:rbuf][(idx + 4)..-1] || ''.b
+        do_handshake(sock, header)
+        c[:handshaken] = true
+      end
+      # 2) 解析帧（循环，直到缓冲里没有完整帧）。
+      loop do
+        frame = extract_frame(c[:rbuf])
+        break unless frame
+        opcode, payload = frame
+        dispatch(sock, opcode, payload)
       end
     end
 
-    def do_handshake(client, data)
-      key = data[/Sec-WebSocket-Key:\s*([^\r\n]+)/i, 1]
-      return unless key
-      accept = Base64.strict_encode64(Digest::SHA1.digest(key.strip + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'))
+    def do_handshake(sock, header)
+      key = header[/Sec-WebSocket-Key:\s*([^\r\n]+)/i, 1]
+      raise 'no websocket key' unless key
+      accept = Base64.strict_encode64(Digest::SHA1.digest(key.strip + WS_GUID))
       response = "HTTP/1.1 101 Switching Protocols\r\n" \
                  "Upgrade: websocket\r\n" \
                  "Connection: Upgrade\r\n" \
                  "Sec-WebSocket-Accept: #{accept}\r\n\r\n"
-      client.write(response)
-      client.instance_variable_set(:@ws_ready, true)
+      sock.write(response)
       puts '[CanvasSync] WebSocket 握手完成'
     end
 
-    def parse_frames(client, data)
-      return if data.bytesize < 2
-      first = data.getbyte(0)
-      second = data.getbyte(1)
-      opcode = first & 0x0F
-      masked = (second & 0x80) != 0
-      len = second & 0x7F
+    # 从缓冲提取一个完整帧，返回 [opcode, payload]；缓冲不足返回 nil。
+    def extract_frame(buf)
+      return nil if buf.bytesize < 2
+      b0 = buf.getbyte(0)
+      b1 = buf.getbyte(1)
+      opcode = b0 & 0x0F
+      masked = (b1 & 0x80) != 0
+      len = b1 & 0x7F
       offset = 2
       if len == 126
-        len = data.byteslice(2, 2).unpack1('n')
+        return nil if buf.bytesize < 4
+        len = buf.byteslice(2, 2).unpack1('n')
         offset = 4
       elsif len == 127
-        len = data.byteslice(2, 8).unpack1('Q>')
+        return nil if buf.bytesize < 10
+        len = buf.byteslice(2, 8).unpack1('Q>')
         offset = 10
       end
-      mask_key = masked ? data.byteslice(offset, 4) : nil
-      offset += 4 if masked
-      payload = data.byteslice(offset, len) || ''
-      payload = unmask(payload, mask_key) if masked && mask_key
-
-      case opcode
-      when 0x8 then remove_client(client)
-      when 0x9 then send_frame(client, 0x8A, payload)
-      when 0x1, 0x0 then handle_command(client, payload.force_encoding('UTF-8'))
+      mask = nil
+      if masked
+        return nil if buf.bytesize < offset + 4
+        mask = buf.byteslice(offset, 4)
+        offset += 4
       end
+      return nil if buf.bytesize < offset + len
+      payload = buf.byteslice(offset, len)
+      payload = unmask(payload, mask) if masked && mask
+      # 从缓冲移除这一帧。
+      rest = buf.byteslice(offset + len, buf.bytesize - offset - len) || ''.b
+      buf.replace(rest)
+      [opcode, payload]
     end
 
     def unmask(payload, mask)
@@ -147,13 +171,24 @@ module SketchUpCanvasSync
       bytes.each_with_index.map { |b, i| (b ^ mask.getbyte(i % 4)) }.pack('C*')
     end
 
-    def handle_command(client, text)
+    def dispatch(sock, opcode, payload)
+      case opcode
+      when 0x8 # close
+        remove_client_by_socket(sock)
+      when 0x9 # ping -> pong
+        send_frame(sock, 0x8A, payload)
+      when 0x1, 0x0 # text / continuation
+        handle_command(sock, payload.force_encoding('UTF-8'))
+      end
+    end
+
+    def handle_command(sock, text)
       msg = JSON.parse(text) rescue {}
       case msg['type']
-      when 'get_camera'   then send_json(client, camera_payload)
-      when 'snapshot'     then send_snapshot(client, msg['width'].to_i)
-      when 'get_models'   then send_json(client, models_payload)
-      when 'get_scenes'   then send_json(client, scenes_payload)
+      when 'get_camera'   then send_json(sock, camera_payload)
+      when 'snapshot'     then send_snapshot(sock, msg['width'].to_i)
+      when 'get_models'   then send_json(sock, models_payload)
+      when 'get_scenes'   then send_json(sock, scenes_payload)
       when 'set_aspect'
         @aspect_w = msg['w'].to_i if msg['w'].to_i > 0
         @aspect_h = msg['h'].to_i if msg['h'].to_i > 0
@@ -204,11 +239,11 @@ module SketchUpCanvasSync
       { type: 'scenes', items: [], error: e.message }
     end
 
-    def send_snapshot(client, width)
+    def send_snapshot(sock, width)
       width = 320 if width <= 0
       model = Sketchup.active_model
       unless model
-        send_json(client, { type: 'snapshot', error: 'no_model' })
+        send_json(sock, { type: 'snapshot', error: 'no_model' })
         return
       end
       view = model.active_view
@@ -216,22 +251,22 @@ module SketchUpCanvasSync
       path = File.join(Dir.tmpdir, "canvas_sync_snap_#{width}.png")
       ok = view.write_image(path, width, height)
       unless ok && File.exist?(path)
-        send_json(client, { type: 'snapshot', error: 'write_image failed' })
+        send_json(sock, { type: 'snapshot', error: 'write_image failed' })
         return
       end
       data = File.binread(path)
       File.delete(path) rescue nil
       b64 = Base64.strict_encode64(data)
-      send_json(client, { type: 'snapshot', width: width, height: height, mime: 'image/png', data: "data:image/png;base64,#{b64}" })
+      send_json(sock, { type: 'snapshot', width: width, height: height, mime: 'image/png', data: "data:image/png;base64,#{b64}" })
     rescue => e
-      send_json(client, { type: 'snapshot', error: e.message })
+      send_json(sock, { type: 'snapshot', error: e.message })
     end
 
-    def send_json(client, obj)
-      send_frame(client, 0x81, JSON.generate(obj))
+    def send_json(sock, obj)
+      send_frame(sock, 0x81, JSON.generate(obj))
     end
 
-    def send_frame(client, opcode, payload)
+    def send_frame(sock, opcode, payload)
       payload = payload.dup.force_encoding('BINARY')
       len = payload.bytesize
       header = if len < 126
@@ -241,14 +276,19 @@ module SketchUpCanvasSync
       else
         [opcode, 127, len].pack('CCQ>')
       end
-      client.write(header + payload)
+      sock.write(header + payload)
     rescue => e
-      remove_client(client)
+      remove_client_by_socket(sock)
     end
 
-    def remove_client(client)
-      @clients.delete(client)
-      client.close rescue nil
+    def remove_client_by_socket(sock)
+      entry = @clients.find { |c| c[:socket] == sock }
+      remove_client(entry) if entry
+    end
+
+    def remove_client(entry)
+      @clients.delete(entry)
+      entry[:socket].close rescue nil
       puts '[CanvasSync] 客户端断开'
     end
   end
