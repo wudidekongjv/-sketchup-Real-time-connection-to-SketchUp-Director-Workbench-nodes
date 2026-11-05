@@ -32,6 +32,8 @@ module SketchUpCanvasSync
   @aspect_h = 9
   @last_model_offset = { cx: 0.0, cz: 0.0, min_y: 0.0 }
   @last_model_size = { width: 0.0, height: 0.0, depth: 0.0 }
+  @last_vertex_count = 0
+  @last_raw_range = { xmin: 0.0, xmax: 0.0, ymin: 0.0, ymax: 0.0, zmin: 0.0, zmax: 0.0 }
   @suppress_broadcast_until = nil
 
   class << self
@@ -227,6 +229,8 @@ module SketchUpCanvasSync
         target: target,
         up: [up.x.to_f, up.y.to_f, up.z.to_f],
         fov: cam.fov.to_f,
+        # SketchUp 的 fov 可能是按「高度」或「宽度」测量，前端需据此换算垂直 fov。
+        fov_is_height: cam.respond_to?(:fov_is_height?) ? cam.fov_is_height? : true,
         aspect_ratio: cam.aspect_ratio.to_f,
         perspective: cam.perspective?,
       }
@@ -315,9 +319,12 @@ module SketchUpCanvasSync
         size: glb.bytesize,
         data: b64,
         bbox: size_info,
+        unit: 'meter',
+        vertex_count: @last_vertex_count,
       })
-      puts "[CanvasSync] 已导出 #{faces.length} 个面的 glb（#{glb.bytesize} 字节）" \
-           " 尺寸 #{size_info[:width].round(2)}×#{size_info[:height].round(2)}×#{size_info[:depth].round(2)} m"
+      puts "[CanvasSync] 导出 #{faces.length} 面 / #{@last_vertex_count} 顶点" \
+           " | 尺寸 #{size_info[:width].round(3)}×#{size_info[:height].round(3)}×#{size_info[:depth].round(3)} 米" \
+           " | 原始世界坐标范围 X[#{@last_raw_range[:xmin].round(1)}, #{@last_raw_range[:xmax].round(1)}] 英寸"
     rescue => e
       puts "[CanvasSync] glb 导出失败：#{e.class}: #{e.message}"
       send_json(sock, { type: 'model', error: e.message })
@@ -389,6 +396,8 @@ module SketchUpCanvasSync
         height: (ys.max - ys.min) * INCH_TO_METER,
         depth: (zs.max - zs.min) * INCH_TO_METER,
       }
+      @last_vertex_count = raw_positions.length
+      @last_raw_range = { xmin: xs.min, xmax: xs.max, ymin: ys.min, ymax: ys.max, zmin: zs.min, zmax: zs.max }
 
       build_glb_binary(positions, indices, colors)
     end

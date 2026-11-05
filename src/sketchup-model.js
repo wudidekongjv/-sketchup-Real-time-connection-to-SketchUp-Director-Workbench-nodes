@@ -71,6 +71,18 @@ function loadGLTFLoader() {
     return gltfLoaderPromise;
 }
 
+// 把 SketchUp 的 fov 统一转换成「垂直视场角」（Three.js 用垂直 fov）。
+function toVerticalFov(msg, aspectW, aspectH) {
+    const fov = Number(msg?.fov);
+    const safe = Number.isFinite(fov) && fov > 0 ? fov : 35;
+    if (msg?.fov_is_height === false) {
+        // SketchUp 的 fov 按宽度测量 → 换算成垂直。
+        const aspect = (aspectW || 16) / (aspectH || 9);
+        return (2 * Math.atan(Math.tan((safe * Math.PI) / 180 / 2) / aspect)) * 180 / Math.PI;
+    }
+    return safe;
+}
+
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -93,9 +105,9 @@ function SketchUpSyncContent({ ctx, React }) {
     const [followSu, setFollowSu] = React.useState(false); // 导演台是否跟随 SU 视角（默认关，避免锁死）
     const followRef = React.useRef(false);
     followRef.current = followSu;
-    // 模型缩放：SU 建筑尺度（米）通常远大于导演台人偶（~1.8），默认放大 7.5 倍以匹配。
-    const [modelScale, setModelScale] = React.useState(7.5);
-    const modelScaleRef = React.useRef(7.5);
+    // 模型缩放：默认 1（保持 SketchUp 真实比例）。只有确认比例不符时才手动调整。
+    const [modelScale, setModelScale] = React.useState(1);
+    const modelScaleRef = React.useRef(1);
     modelScaleRef.current = modelScale;
 
     const ctxRef = React.useRef(ctx);
@@ -163,8 +175,8 @@ function SketchUpSyncContent({ ctx, React }) {
         cam.position.set(msg.eye[0], msg.eye[1], msg.eye[2]);
         cam.up.set(0, 1, 0);
         cam.lookAt(msg.target[0], msg.target[1], msg.target[2]);
-        if (Number.isFinite(msg.fov) && msg.fov > 0) cam.fov = msg.fov;
         const a = aspectRef.current;
+        cam.fov = toVerticalFov(msg, a.w, a.h);
         cam.aspect = a.w / a.h;
         cam.updateProjectionMatrix();
         render();
@@ -244,7 +256,9 @@ function SketchUpSyncContent({ ctx, React }) {
         }
         const c = lastCameraRef.current;
         if (c?.eye && c?.target) {
-            sendToDirector("storyai:director-desk-camera", { eye: c.eye, target: c.target, fov: c.fov, follow: followRef.current });
+            sendToDirector("storyai:director-desk-camera", {
+                eye: c.eye, target: c.target, fov: c.vFov ?? c.fov, follow: followRef.current,
+            });
         }
         const bd = lastBackdropRef.current;
         if (bd) {
@@ -363,14 +377,16 @@ function SketchUpSyncContent({ ctx, React }) {
     const handleMessage = (msg) => {
         if (msg.type === "camera") {
             if (msg.eye) {
-                lastCameraRef.current = msg;
+                const a = aspectRef.current;
+                const normalized = { ...msg, vFov: toVerticalFov(msg, a.w, a.h) };
+                lastCameraRef.current = normalized;
                 setCamera(msg);
                 void applyCamera(msg);
                 scheduleSnapshot();
-                // 转发给导演台（若已打开）：实现导演台实时跟随 SU 视角。
+                // 转发给导演台（若已打开）：统一用垂直 fov。
                 if (directorReadyRef.current) {
                     sendToDirector("storyai:director-desk-camera", {
-                        eye: msg.eye, target: msg.target, fov: msg.fov, follow: followRef.current,
+                        eye: msg.eye, target: msg.target, fov: normalized.vFov, follow: followRef.current,
                     });
                 }
             }
@@ -378,7 +394,11 @@ function SketchUpSyncContent({ ctx, React }) {
         }
         if (msg.type === "model") {
             if (msg.data) {
-                const info = { name: msg.name || "SketchUp模型", size: msg.size, bbox: msg.bbox || null, base64: msg.data };
+                const info = {
+                    name: msg.name || "SketchUp模型", size: msg.size,
+                    bbox: msg.bbox || null, base64: msg.data,
+                    vertexCount: msg.vertex_count || 0,
+                };
                 setModelInfo({ name: info.name, size: info.size, bbox: info.bbox });
                 lastModelRef.current = info;
                 const bboxText = msg.bbox ? `（${msg.bbox.width.toFixed(2)}×${msg.bbox.height.toFixed(2)}×${msg.bbox.depth.toFixed(2)} m）` : "";
@@ -572,10 +592,18 @@ function SketchUpSyncContent({ ctx, React }) {
                 modelInfo.bbox ? ` · ${modelInfo.bbox.width.toFixed(2)}×${modelInfo.bbox.height.toFixed(2)}×${modelInfo.bbox.depth.toFixed(2)} m` : "",
             )
             : null,
-        camera
-            ? h("div", { style: { fontSize: 10, color: muted, whiteSpace: "pre-wrap" } },
-                `相机 eye(${camera.eye.map((n) => n.toFixed(2)).join(", ")}) · fov ${camera.fov?.toFixed(1)}°`)
-            : null,
+        // 诊断：尺寸 / 相机 / fov 方向，用于核对坐标系是否一致。
+        h("div", { style: { fontSize: 10, color: muted, whiteSpace: "pre-wrap", borderTop: `1px dashed ${stroke}`, paddingTop: 6, lineHeight: 1.7 } },
+            modelInfo?.bbox
+                ? `模型尺寸(W×H×D)：${modelInfo.bbox.width.toFixed(3)} × ${modelInfo.bbox.height.toFixed(3)} × ${modelInfo.bbox.depth.toFixed(3)} 米\n顶点数：${modelInfo.vertexCount}\n`
+                : "",
+            camera
+                ? `相机 eye(${camera.eye.map((n) => n.toFixed(2)).join(", ")})\n` +
+                  `target(${camera.target.map((n) => n.toFixed(2)).join(", ")})\n` +
+                  `fov ${camera.fov?.toFixed(2)}° · fov按${camera.fov_is_height === false ? "宽度" : "高度"}测量` +
+                  ` → 垂直fov ${toVerticalFov(camera, aspect.w, aspect.h).toFixed(2)}°`
+                : "",
+        ),
 
         h("div", { style: { fontSize: 10, color: muted, borderTop: `1px solid ${stroke}`, paddingTop: 6, lineHeight: 1.6 } },
             "分层渲染：底层 = SketchUp 截图（含全部场景），上层 = 选中模型的实时 3D。同一相机，自动对齐。",
