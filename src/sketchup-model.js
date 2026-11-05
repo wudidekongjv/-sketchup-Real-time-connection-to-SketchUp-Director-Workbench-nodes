@@ -1,102 +1,53 @@
-// Infinite Canvas SketchUp 模型同步节点 —— Three.js 场景。
-// 连接 ws://127.0.0.1:8899，接收 SketchUp 导出的 glb 模型 + 实时相机，
-// 用 Three.js 渲染 3D 场景，截图回传画布（供 AI 生图保持场景一致）。
+// Infinite Canvas SketchUp ↔ 导演台 联动节点。
+// 功能：
+//   1) 连接本地 ws://127.0.0.1:8899（SketchUp Ruby 插件）
+//   2) 接收 SketchUp 选中的模型（glb base64）
+//   3) 打开改造版 3D 导演台 iframe，把模型作为 prop 注入场景
+//   4) 导演台截图回传画布（供 AI 生图保持场景一致）
+// 导演台 = xiaozangao/3d-director-desk 改造版（新增 model 注入协议），部署在 jsDelivr。
 
 const WS_URL = "ws://127.0.0.1:8899";
-const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
-const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
-
-let threePromise = null;
-async function loadThree() {
-    if (!threePromise) {
-        threePromise = import(/* @vite-ignore */ THREE_BASE);
-    }
-    return threePromise;
-}
-
-let gltfLoaderPromise = null;
-async function loadGLTFLoader() {
-    if (!gltfLoaderPromise) {
-        gltfLoaderPromise = import(/* @vite-ignore */ GLTFLOADER_URL).then(async (mod) => {
-            const THREE = await loadThree();
-            return mod.GLTFLoader || mod.default;
-        });
-    }
-    return gltfLoaderPromise;
-}
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@main";
 
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function SketchUpModelContent({ ctx, React }) {
+function SketchUpDirectorContent({ ctx, React }) {
     const h = React.createElement;
 
     const [connected, setConnected] = React.useState(false);
     const [status, setStatus] = React.useState("未连接");
     const [error, setError] = React.useState("");
-    const [modelInfo, setModelInfo] = React.useState(null); // { name, size }
-    const [cameraInfo, setCameraInfo] = React.useState(null);
+    const [modelInfo, setModelInfo] = React.useState(null);
+    const [directorOpen, setDirectorOpen] = React.useState(false);
+    const [pendingModel, setPendingModel] = React.useState(null); // { name, fileName, base64 }
 
     const ctxRef = React.useRef(ctx);
     ctxRef.current = ctx;
     const wsRef = React.useRef(null);
-    const canvasRef = React.useRef(null);
-    const sceneRef = React.useRef(null); // { renderer, scene, camera, model }
-    const pendingCameraRef = React.useRef(null);
-    const currentDataUrlRef = React.useRef(null);
+    const frameRef = React.useRef(null);
+    const overlayRef = React.useRef(null);
+    const directorReadyRef = React.useRef(false);
+    const pendingModelRef = React.useRef(null);
 
-    // 初始化 Three.js 场景。
-    const initScene = async () => {
-        if (sceneRef.current) return sceneRef.current;
-        const THREE = await loadThree();
-        const canvas = canvasRef.current;
-        if (!canvas) return null;
-
-        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
-        const w = canvas.clientWidth || 400;
-        const hgt = canvas.clientHeight || 300;
-        renderer.setSize(w, hgt, false);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x2a2a2a);
-        scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-        const dir = new THREE.DirectionalLight(0xffffff, 1.2);
-        dir.position.set(5, 10, 7);
-        scene.add(dir);
-
-        const camera = new THREE.PerspectiveCamera(60, w / hgt, 0.01, 1000);
-        camera.position.set(5, 5, 5);
-        camera.lookAt(0, 0, 0);
-
-        sceneRef.current = { renderer, scene, camera, model: null };
-        render(sceneRef.current);
-        return sceneRef.current;
-    };
-
-    const render = (s) => {
-        if (!s) return;
-        s.renderer.render(s.scene, s.camera);
-    };
-
+    // ── WebSocket：接收 SketchUp 数据 ──
     const connect = () => {
         setError("");
         setStatus("连接中…");
         try {
             const ws = new WebSocket(WS_URL);
             wsRef.current = ws;
-            ws.binaryType = "arraybuffer";
             ws.onopen = () => {
                 setConnected(true);
                 setStatus("已连接 SketchUp ✅");
                 ws.send(JSON.stringify({ type: "get_camera" }));
             };
-            ws.onmessage = async (event) => {
+            ws.onmessage = (event) => {
                 try {
                     const msg = JSON.parse(event.data);
-                    await handleMessage(msg);
+                    handleSketchUpMessage(msg);
                 } catch (_e) { /* 非 JSON */ }
             };
             ws.onerror = () => setError("连接出错（请确认 SketchUp 已启动 CanvasSync 服务）");
@@ -110,107 +61,136 @@ function SketchUpModelContent({ ctx, React }) {
         }
     };
 
-    const handleMessage = async (msg) => {
-        switch (msg.type) {
-            case "camera":
-                if (msg.eye) {
-                    pendingCameraRef.current = msg;
-                    setCameraInfo(msg);
-                    applyCamera(msg);
-                }
-                break;
-            case "model":
-                if (msg.data) {
-                    setStatus(`加载模型中…（${(msg.size / 1024 / 1024).toFixed(2)} MB）`);
-                    await loadModel(msg.data);
-                    setModelInfo({ name: msg.name, size: msg.size });
-                    setStatus("模型已加载 ✅");
-                } else if (msg.error) {
-                    setError(`模型导出失败：${msg.error}`);
-                }
-                break;
-            case "error":
-                setError(msg.message || "未知错误");
-                break;
+    const handleSketchUpMessage = (msg) => {
+        if (msg.type === "model") {
+            if (msg.data) {
+                const model = { name: msg.name || "SketchUp模型", fileName: "sketchup-model.glb", base64: msg.data, size: msg.size };
+                setModelInfo(model);
+                setPendingModel(model);
+                pendingModelRef.current = model;
+                setStatus(`收到模型：${model.name}（${(msg.size / 1024).toFixed(1)} KB）`);
+                // 如果导演台已打开且就绪，立即注入；否则等打开后注入。
+                injectModelIfReady();
+            } else if (msg.error) {
+                setError(`模型导出失败：${msg.error}`);
+            }
         }
     };
 
-    const applyCamera = async (msg) => {
-        const s = await initScene();
-        if (!s || !msg.eye) return;
-        const THREE = await loadThree();
-        s.camera.position.set(msg.eye[0], msg.eye[1], msg.eye[2]);
-        if (msg.target) s.camera.lookAt(msg.target[0], msg.target[1], msg.target[2]);
-        if (msg.up) s.camera.up.set(msg.up[0], msg.up[1], msg.up[2]);
-        if (msg.fov) s.camera.fov = msg.fov;
-        if (msg.aspect_ratio && msg.aspect_ratio > 0) s.camera.aspect = msg.aspect_ratio;
-        s.camera.updateProjectionMatrix();
-        render(s);
+    // ── 导演台 iframe ──
+    const openDirector = () => {
+        if (directorOpen) return;
+        const origin = window.location.origin;
+        const instanceId = `sketchup-${ctxRef.current.node.id}`;
+        const src = `${DIRECTOR_BASE}/index.html?instanceId=${encodeURIComponent(instanceId)}&hostOrigin=${encodeURIComponent(origin)}&theme=dark`;
+
+        const overlay = document.createElement("div");
+        overlay.style.cssText = "position:fixed;inset:0;z-index:2147483000;background:#090909";
+        document.body.appendChild(overlay);
+        overlayRef.current = overlay;
+
+        const iframe = document.createElement("iframe");
+        iframe.title = "3D导演台";
+        iframe.allow = "fullscreen";
+        iframe.referrerPolicy = "no-referrer";
+        iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0";
+        iframe.src = src;
+        overlay.appendChild(iframe);
+        frameRef.current = iframe;
+
+        const closeBtn = document.createElement("button");
+        closeBtn.textContent = "关闭导演台";
+        closeBtn.style.cssText = "position:absolute;right:16px;top:12px;z-index:2;border:1px solid #ffffff44;border-radius:8px;padding:6px 10px;background:#0008;color:#fff;cursor:pointer";
+        closeBtn.onclick = closeDirector;
+        overlay.appendChild(closeBtn);
+
+        setDirectorOpen(true);
+        setStatus("导演台已打开，等待加载…");
+
+        // 监听导演台消息。
+        const handleMessage = (event) => {
+            const frame = frameRef.current;
+            if (!frame || event.source !== frame.contentWindow) return;
+            const type = event.data?.type;
+            if (type === "storyai:director-desk-ready") {
+                directorReadyRef.current = true;
+                setStatus("导演台就绪 ✅");
+                injectModelIfReady();
+            } else if (type === "storyai:director-desk-captures-sent") {
+                const captures = Array.isArray(event.data?.payload?.captures) ? event.data.payload.captures : [];
+                captures.forEach((cap) => {
+                    if (typeof cap?.dataUrl === "string" && cap.dataUrl.startsWith("data:image/")) {
+                        addCaptureToCanvas(cap.dataUrl, cap.fileName);
+                    }
+                });
+                setStatus(`已回传 ${captures.length} 张截图到画布`);
+            } else if (type === "storyai:director-desk-close") {
+                closeDirector();
+            }
+        };
+        window.addEventListener("message", handleMessage);
+        overlayRef.current._cleanup = () => window.removeEventListener("message", handleMessage);
     };
 
-    const loadModel = async (base64) => {
-        const s = await initScene();
-        if (!s) return;
-        const THREE = await loadThree();
-        const GLTFLoader = await loadGLTFLoader();
+    const closeDirector = () => {
+        directorReadyRef.current = false;
+        setDirectorOpen(false);
+        if (overlayRef.current) {
+            overlayRef.current._cleanup?.();
+            overlayRef.current.remove();
+            overlayRef.current = null;
+        }
+        frameRef.current = null;
+    };
 
-        // base64 → arraybuffer
-        const bin = atob(base64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const sendToDirector = (type, payload) => {
+        frameRef.current?.contentWindow?.postMessage({ type, payload }, "*");
+    };
 
-        const loader = new GLTFLoader();
-        const gltf = await new Promise((resolve, reject) => {
-            loader.parse(bytes.buffer, "", resolve, reject);
+    const injectModelIfReady = () => {
+        const model = pendingModelRef.current;
+        if (!model || !directorReadyRef.current || !frameRef.current) return;
+        // 注入模型（base64 → dataUrl）。
+        const dataUrl = `data:model/gltf-binary;base64,${model.base64}`;
+        sendToDirector("storyai:director-desk-model", {
+            sourceNodeId: ctxRef.current.node.id,
+            name: model.name,
+            fileName: model.fileName,
+            modelUrl: dataUrl,
+            modelFormat: "glb",
         });
-
-        // 移除旧模型。
-        if (s.model) {
-            s.scene.remove(s.model);
-            s.model.traverse((obj) => { if (obj.geometry) obj.geometry.dispose(); if (obj.material) obj.material.dispose(); });
-        }
-        s.model = gltf.scene;
-
-        // 计算包围盒，调整相机视野。
-        const box = new THREE.Box3().setFromObject(s.model);
-        const center = box.getCenter(new THREE.Vector3());
-        const size = box.getSize(new THREE.Vector3());
-        const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        s.model.position.sub(center);
-        s.scene.add(s.model);
-
-        render(s);
+        pendingModelRef.current = null;
+        setStatus(`已注入模型到导演台：${model.name}`);
     };
 
-    // 截图 → dataURL → 回传画布。
-    const captureToCanvas = async () => {
-        const s = await initScene();
-        if (!s) return;
-        const dataUrl = s.renderer.domElement.toDataURL("image/png");
-        currentDataUrlRef.current = dataUrl;
-        setStatus("已截图，可回传画布");
-    };
-
-    const sendToCanvas = () => {
-        const dataUrl = currentDataUrlRef.current;
-        if (!dataUrl) { setStatus("请先截图"); return; }
+    const addCaptureToCanvas = (dataUrl, fileName) => {
         const node = ctxRef.current.node;
-        const id = randomId("su-model");
-        ctxRef.current.applyOps([
-            {
-                type: "add_node", id, nodeType: "image", title: "SketchUp场景截图.png",
-                x: node.position.x + node.width + 96, y: node.position.y,
-                width: 400, height: 300,
-                metadata: { content: dataUrl, status: "success", naturalWidth: 800, naturalHeight: 600, mimeType: "image/png" },
-            },
-            { type: "connect_nodes", fromNodeId: node.id, toNodeId: id },
-        ]);
-        setStatus("已回传场景截图到画布");
+        const id = randomId("director-capture");
+        const img = new Image();
+        img.onload = () => {
+            const w = img.naturalWidth || 800;
+            const hgt = img.naturalHeight || 600;
+            const scale = Math.min(1, 500 / Math.max(w, 1));
+            ctxRef.current.applyOps([
+                {
+                    type: "add_node", id, nodeType: "image",
+                    title: fileName || "导演台截图.png",
+                    x: node.position.x + node.width + 96, y: node.position.y,
+                    width: Math.max(120, Math.round(w * scale)), height: Math.max(90, Math.round(hgt * scale)),
+                    metadata: { content: dataUrl, status: "success", naturalWidth: w, naturalHeight: hgt, mimeType: "image/png" },
+                },
+                { type: "connect_nodes", fromNodeId: node.id, toNodeId: id },
+            ]);
+        };
+        img.src = dataUrl;
     };
 
     React.useEffect(() => {
         connect();
-        return () => { if (wsRef.current) wsRef.current.close(); };
+        return () => {
+            if (wsRef.current) wsRef.current.close();
+            closeDirector();
+        };
     }, []);
 
     const muted = ctx.theme.node.muted;
@@ -226,52 +206,53 @@ function SketchUpModelContent({ ctx, React }) {
         { "data-canvas-no-zoom": true, style: { display: "flex", flexDirection: "column", gap: 10, padding: 12, width: "100%", height: "100%", boxSizing: "border-box", overflowY: "auto", color: text, fontSize: 12 } },
         h("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
             h("span", { style: { fontSize: 18 } }, "🏛️"),
-            h("span", { style: { fontSize: 14, fontWeight: 600 } }, "SketchUp 模型场景"),
+            h("span", { style: { fontSize: 14, fontWeight: 600 } }, "SketchUp → 导演台"),
         ),
         h("div", { style: { fontSize: 12 } }, `状态：${status}`),
         error ? h("div", { style: { color: "#ef9a9a", fontSize: 11, whiteSpace: "pre-wrap" } }, error) : null,
         h("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
             h("button", { type: "button", style: primaryStyle, onClick: connect, disabled: connected }, connected ? "已连接" : "连接 SketchUp"),
-            h("button", { type: "button", style: buttonStyle, onClick: captureToCanvas }, "截图预览"),
-            h("button", { type: "button", style: primaryStyle, onClick: sendToCanvas }, "回传画布"),
+            h("button", { type: "button", style: primaryStyle, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "打开导演台"),
         ),
-        // Three.js 渲染画布
-        h("canvas", {
-            ref: canvasRef,
-            style: { width: "100%", aspectRatio: "16/9", borderRadius: 8, border: `1px solid ${stroke}`, background: "#2a2a2a", display: "block" },
-            onMouseDown: (e) => e.stopPropagation(),
-        }),
         modelInfo
-            ? h("div", { style: { fontSize: 11, color: muted } }, `模型：${modelInfo.name}（${(modelInfo.size / 1024).toFixed(1)} KB）`)
-            : h("div", { style: { fontSize: 11, color: muted } }, "请在 SketchUp 选中模型，点「CanvasSync → 发送选中模型」"),
-        cameraInfo
-            ? h("div", { style: { fontSize: 11, color: muted, whiteSpace: "pre-wrap" } },
-                `相机 eye(${cameraInfo.eye.map((n) => n.toFixed(2)).join(", ")}) fov ${cameraInfo.fov?.toFixed(1)}°`,
-            )
+            ? h("div", { style: { fontSize: 11, color: muted } }, `已接收模型：${modelInfo.name}（${(modelInfo.size / 1024).toFixed(1)} KB）`)
             : null,
-        h("div", { style: { fontSize: 10, color: muted, borderTop: `1px solid ${stroke}`, paddingTop: 6 } }, "提示：相机实时跟随 SketchUp；模型需手动发送。截图可回传画布作为 AI 生图参考。"),
+        h("div", { style: { fontSize: 11, color: muted, lineHeight: 1.6 } },
+            "使用步骤：",
+            h("br"),
+            "1. SketchUp 菜单「扩展程序 → CanvasSync → 启动服务」",
+            h("br"),
+            "2. 本节点点「连接 SketchUp」",
+            h("br"),
+            "3. SketchUp 里选中模型 → 「CanvasSync → 发送选中模型」",
+            h("br"),
+            "4. 点「打开导演台」，模型会自动注入为场景道具",
+            h("br"),
+            "5. 在导演台里布置人物/机位/动作，截图自动回传画布",
+        ),
+        h("div", { style: { fontSize: 10, color: muted, borderTop: `1px solid ${stroke}`, paddingTop: 6 } }, "提示：导演台保留人物/机位/动作全部功能，SketchUp 模型作为场景道具接入，保证 AI 生图场景一致。"),
     );
 }
 
-export default function createSketchUpModelPlugin(runtime) {
+export default function createSketchUpDirectorPlugin(runtime) {
     const React = runtime.React;
     return {
-        id: "sketchup-model",
-        name: "SketchUp 模型场景",
-        version: "0.1.0",
+        id: "sketchup-director",
+        name: "SketchUp 导演台联动",
+        version: "0.2.0",
         minAppVersion: "0.12.0",
-        description: "导入 SketchUp 选中模型，用 Three.js 渲染，相机实时同步，截图回传画布保持场景一致。",
+        description: "把 SketchUp 选中模型导入 3D 导演台作为场景，保留人物/机位/动作功能，截图回传保持 AI 生图场景一致。",
         nodes: [
             {
-                type: "sketchup:model",
-                title: "SketchUp 模型场景",
+                type: "sketchup:director",
+                title: "SketchUp 导演台联动",
                 icon: "🏛️",
-                description: "导入 SketchUp 模型 + 相机同步 + 截图回传",
-                defaultSize: { width: 400, height: 560 },
+                description: "SketchUp 模型 → 3D 导演台（人物/机位/动作）→ 截图回传",
+                defaultSize: { width: 400, height: 420 },
                 defaultMetadata: {},
                 hasSourceHandle: false,
                 hidePanel: true,
-                Content: (props) => SketchUpModelContent({ ...props, React }),
+                Content: (props) => SketchUpDirectorContent({ ...props, React }),
             },
         ],
     };
