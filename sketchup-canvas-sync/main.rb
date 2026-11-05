@@ -191,7 +191,7 @@ module SketchUpCanvasSync
       msg = JSON.parse(text) rescue {}
       case msg['type']
       when 'get_camera'       then send_json(sock, camera_payload)
-      when 'snapshot'         then send_snapshot(sock, msg['width'].to_i)
+      when 'snapshot'         then send_snapshot(sock, msg['width'].to_i, msg['hide_selection'] == true)
       when 'send_selection'   then send_selection_glb(sock)
       when 'set_aspect'
         @aspect_w = msg['w'].to_i if msg['w'].to_i > 0
@@ -333,29 +333,25 @@ module SketchUpCanvasSync
 
       return nil if raw_positions.empty?
 
-      # 第二步：坐标轴转换 + 居中 + 英寸→米。
+      # 第二步：坐标轴转换 + 英寸→米。
       # SketchUp 是 Z-up（X右 Y前 Z上），glTF/Three.js 是 Y-up（X右 Y上 Z朝观察者）。
       # 映射：glTF.x = SU.x, glTF.y = SU.z, glTF.z = -SU.y
+      # 重要：不做居中/平移，保留 SketchUp 原始世界坐标，这样和 SU 相机截图才能严丝合缝对齐。
       converted = raw_positions.map { |(x, y, z)| [x, z, -y] }
 
-      # 计算包围盒：X/Z 居中，Y 底部贴地（Y=0），这样模型和人偶站在同一地面。
       xs = converted.map { |v| v[0] }
       ys = converted.map { |v| v[1] }
       zs = converted.map { |v| v[2] }
-      cx = (xs.min + xs.max) / 2.0
-      cz = (zs.min + zs.max) / 2.0
-      min_y = ys.min
 
       positions = []
       converted.each do |(x, y, z)|
-        positions << (x - cx) * INCH_TO_METER
-        positions << (y - min_y) * INCH_TO_METER
-        positions << (z - cz) * INCH_TO_METER
+        positions << x * INCH_TO_METER
+        positions << y * INCH_TO_METER
+        positions << z * INCH_TO_METER
       end
 
-      # 记录偏移量，供相机同步对齐使用（相机也要减同样偏移）。
-      @last_model_offset = { cx: cx, cz: cz, min_y: min_y }
-      # 记录包围盒尺寸（米），供画布显示与判断单位。
+      # 偏移量归零（保留原始坐标，不居中）。
+      @last_model_offset = { cx: 0.0, cz: 0.0, min_y: 0.0 }
       @last_model_size = {
         width: (xs.max - xs.min) * INCH_TO_METER,
         height: (ys.max - ys.min) * INCH_TO_METER,
@@ -470,7 +466,8 @@ module SketchUpCanvasSync
     end
 
     # ── 截图 ──
-    def send_snapshot(sock, width)
+    # hide_selection=true 时，截图前隐藏选中实体（分层渲染：截图只含背景，3D 层只含选中模型）。
+    def send_snapshot(sock, width, hide_selection)
       width = 320 if width <= 0
       model = Sketchup.active_model
       unless model
@@ -479,16 +476,44 @@ module SketchUpCanvasSync
       end
       view = model.active_view
       height = (width * @aspect_h.to_f / @aspect_w.to_f).round
-      path = File.join(Dir.tmpdir, "canvas_sync_snap_#{width}.png")
-      ok = view.write_image(path, width, height)
-      unless ok && File.exist?(path)
-        send_json(sock, { type: 'snapshot', error: 'write_image failed' })
-        return
+
+      hidden = []
+      if hide_selection
+        begin
+          model.selection.each do |entity|
+            next unless entity.respond_to?(:visible=)
+            hidden << [entity, entity.visible?]
+            entity.visible = false
+          end
+          view.refresh
+        rescue => e
+          puts "[CanvasSync] 隐藏选中失败：#{e.message}"
+        end
       end
-      data = File.binread(path)
-      File.delete(path) rescue nil
-      b64 = Base64.strict_encode64(data)
-      send_json(sock, { type: 'snapshot', width: width, height: height, mime: 'image/png', data: "data:image/png;base64,#{b64}" })
+
+      begin
+        path = File.join(Dir.tmpdir, "canvas_sync_snap_#{width}.png")
+        ok = view.write_image(path, width, height)
+        unless ok && File.exist?(path)
+          send_json(sock, { type: 'snapshot', error: 'write_image failed' })
+          return
+        end
+        data = File.binread(path)
+        File.delete(path) rescue nil
+        b64 = Base64.strict_encode64(data)
+        send_json(sock, {
+          type: 'snapshot',
+          width: width,
+          height: height,
+          mime: 'image/png',
+          hide_selection: hide_selection,
+          data: "data:image/png;base64,#{b64}",
+        })
+      ensure
+        # 无论成功失败，恢复可见性。
+        hidden.each { |(entity, was_visible)| entity.visible = was_visible rescue nil }
+        view.refresh if hide_selection
+      end
     rescue => e
       send_json(sock, { type: 'snapshot', error: e.message })
     end
