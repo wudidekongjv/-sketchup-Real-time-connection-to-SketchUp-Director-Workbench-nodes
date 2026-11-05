@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@aaf71a3da2a18f0298d724c9b81a412e1717ab93";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@997c2028c990429577bf5bfdcd75f7da184cd03c";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -136,7 +136,7 @@ function SketchUpSyncContent({ ctx, React }) {
     const [camera, setCamera] = React.useState(null);
     const [modelInfo, setModelInfo] = React.useState(null);
     const [backdrop, setBackdrop] = React.useState(null);
-    const [autoSync, setAutoSync] = React.useState(true);
+    const [autoSync, setAutoSync] = React.useState(false);
     const [busy, setBusy] = React.useState(false);
     const [directorOpen, setDirectorOpen] = React.useState(false);
     const [directorStatus, setDirectorStatus] = React.useState("");
@@ -212,8 +212,13 @@ function SketchUpSyncContent({ ctx, React }) {
     };
 
     // ── 相机同步：与 SketchUp 完全一致的 eye / target / fov / aspect ──
+    let lastRenderAt = 0;
     const applyCamera = async (msg) => {
         if (!msg?.eye || !msg?.target) return;
+        // 渲染节流：最多 20fps，避免占满主进程。
+        const now = performance.now();
+        if (now - lastRenderAt < 50) return;
+        lastRenderAt = now;
         const s = await initScene();
         if (!s) return;
         const cam = s.camera;

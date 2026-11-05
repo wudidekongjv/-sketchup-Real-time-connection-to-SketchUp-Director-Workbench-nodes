@@ -35,6 +35,7 @@ module SketchUpCanvasSync
   @last_vertex_count = 0
   @last_raw_range = { xmin: 0.0, xmax: 0.0, ymin: 0.0, ymax: 0.0, zmin: 0.0, zmax: 0.0 }
   @suppress_broadcast_until = nil
+  @last_camera_key = nil
 
   class << self
     def running?
@@ -47,7 +48,7 @@ module SketchUpCanvasSync
         @server = TCPServer.new(HOST, PORT)
         @running = true
         @timer_id = UI.start_timer(0.05, true) { tick }
-        @camera_timer_id = UI.start_timer(0.3, true) { broadcast_camera }
+        @camera_timer_id = UI.start_timer(0.4, true) { broadcast_camera }
         puts '[CanvasSync] 服务已启动 ws://127.0.0.1:8899'
       rescue => e
         @server = nil
@@ -282,7 +283,16 @@ module SketchUpCanvasSync
       if @suppress_broadcast_until && Time.now < @suppress_broadcast_until
         return
       end
-      payload = JSON.generate(camera_payload)
+
+      data = camera_payload
+      # 相机没变化就不广播（避免每 300ms 刷屏，拖垮前端渲染）。
+      key = [data[:eye], data[:target], data[:fov]]
+      if @last_camera_key == key
+        return
+      end
+      @last_camera_key = key
+
+      payload = JSON.generate(data)
       @mutex.synchronize do
         @clients.each { |c| send_frame(c[:socket], 0x81, payload) if c[:handshaken] }
       end
