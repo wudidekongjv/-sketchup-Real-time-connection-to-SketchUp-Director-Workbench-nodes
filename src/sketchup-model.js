@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@d7c2b7f11f0e4427d380081ab43c089c464fc96f";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@aaf71a3da2a18f0298d724c9b81a412e1717ab93";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -96,6 +96,25 @@ const persistent = {
 };
 
 const FRAME_ID = "sketchup-director-frame";
+const SCENE_KEY_PREFIX = "sketchup-director-scene:";
+
+// 场景持久化：按节点 ID 隔离存 localStorage（画布域稳定可用，srcdoc 内不可用）。
+function loadSceneForNode(nodeId) {
+    try {
+        const raw = localStorage.getItem(SCENE_KEY_PREFIX + nodeId);
+        return raw ? JSON.parse(raw) : null;
+    } catch {
+        return null;
+    }
+}
+
+function saveSceneForNode(nodeId, project) {
+    try {
+        localStorage.setItem(SCENE_KEY_PREFIX + nodeId, JSON.stringify(project));
+    } catch {
+        // 超出配额等忽略
+    }
+}
 
 function getLiveFrame() {
     const el = document.getElementById(FRAME_ID);
@@ -124,6 +143,10 @@ function SketchUpSyncContent({ ctx, React }) {
     const [followSu, setFollowSu] = React.useState(false); // 导演台是否跟随 SU 视角（默认关，避免锁死）
     const followRef = React.useRef(false);
     followRef.current = followSu;
+    // 反向控制（导演台 → SU）：默认关闭，避免与 SU 广播形成回环导致视角漂移。
+    const [reverseSync, setReverseSync] = React.useState(false);
+    const reverseRef = React.useRef(false);
+    reverseRef.current = reverseSync;
     // 模型缩放：默认 1（保持 SketchUp 真实比例）。只有确认比例不符时才手动调整。
     const [modelScale, setModelScale] = React.useState(1);
     const modelScaleRef = React.useRef(1);
@@ -337,6 +360,12 @@ function SketchUpSyncContent({ ctx, React }) {
                 persistent.ready = true;
                 loadingDiv.remove();
                 setDirectorStatus("导演台就绪 ✅");
+                // 把画布节点里保存的场景注入导演台（srcdoc 无 localStorage）。
+                sendToDirector("storyai:director-desk-session", {
+                    instanceId: `sketchup-${ctxRef.current.node.id}`,
+                    theme: "dark",
+                    project: loadSceneForNode(ctxRef.current.node.id),
+                });
                 pushToDirector();
             } else if (type === "storyai:director-desk:response") {
                 const p = event.data?.payload;
@@ -363,7 +392,8 @@ function SketchUpSyncContent({ ctx, React }) {
             } else if (type === "storyai:director-desk-close") {
                 closeDirector();
             } else if (type === "storyai:director-desk-viewport-changed") {
-                // 反向控制：导演台视角变化 → 回写 SketchUp 相机。
+                // 反向控制：导演台视角变化 → 回写 SketchUp 相机（默认关闭）。
+                if (!reverseRef.current) return;
                 const p = event.data?.payload;
                 if (p?.eye && p?.target && wsRef.current?.readyState === 1) {
                     wsRef.current.send(JSON.stringify({
@@ -661,6 +691,14 @@ function SketchUpSyncContent({ ctx, React }) {
                 return;
             }
 
+            if (type === "storyai:director-desk-project") {
+                const proj = event.data?.payload?.project;
+                if (proj && typeof proj === "object") {
+                    saveSceneForNode(ctxRef.current.node.id, proj);
+                }
+                return;
+            }
+
             if (type === "storyai:director-desk-captures-sent") {
                 const caps = Array.isArray(event.data?.payload?.captures) ? event.data.payload.captures : [];
                 caps.forEach((cap) => {
@@ -761,13 +799,16 @@ function SketchUpSyncContent({ ctx, React }) {
                 },
             }, "应用"),
         ),
-        // 双向控制开关
-        h("div", { style: { display: "flex", gap: 12, flexWrap: "wrap", fontSize: 11, color: muted } },
+        // 同步开关
+        h("div", { style: { display: "flex", gap: 14, flexWrap: "wrap", fontSize: 11, color: muted } },
             h("label", { style: { display: "flex", alignItems: "center", gap: 5 } },
                 h("input", { type: "checkbox", checked: followSu, onChange: (e) => setFollowSu(e.target.checked) }),
                 "导演台跟随 SU 视角",
             ),
-            h("span", { style: { opacity: 0.7 } }, "（导演台转视角会自动回写 SU）"),
+            h("label", { style: { display: "flex", alignItems: "center", gap: 5 } },
+                h("input", { type: "checkbox", checked: reverseSync, onChange: (e) => setReverseSync(e.target.checked) }),
+                "导演台视角回写 SU（默认关）",
+            ),
         ),
 
         h("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: muted } },
