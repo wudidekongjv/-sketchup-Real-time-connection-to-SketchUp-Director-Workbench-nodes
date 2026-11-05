@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@ff10f8813b5d5a33f22dee1702d7010e62fd1f77";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@e2de8ebf2429a5e4547e4519d50eb8579a40be5e";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -93,6 +93,10 @@ function SketchUpSyncContent({ ctx, React }) {
     const [followSu, setFollowSu] = React.useState(false); // 导演台是否跟随 SU 视角（默认关，避免锁死）
     const followRef = React.useRef(false);
     followRef.current = followSu;
+    // 模型缩放：SU 建筑尺度（米）通常远大于导演台人偶（~1.8），默认放大 7.5 倍以匹配。
+    const [modelScale, setModelScale] = React.useState(7.5);
+    const modelScaleRef = React.useRef(7.5);
+    modelScaleRef.current = modelScale;
 
     const ctxRef = React.useRef(ctx);
     ctxRef.current = ctx;
@@ -235,6 +239,7 @@ function SketchUpSyncContent({ ctx, React }) {
                 fileName: "sketchup-model.glb",
                 modelUrl: `data:model/gltf-binary;base64,${m.base64}`,
                 modelFormat: "glb",
+                scale: modelScaleRef.current,
             });
         }
         const c = lastCameraRef.current;
@@ -530,6 +535,22 @@ function SketchUpSyncContent({ ctx, React }) {
         h("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
             h("button", { type: "button", style: { ...primaryStyle, background: "#7c5cff" }, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "🎬 打开 3D 导演台"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
+        ),
+        // 模型缩放
+        h("div", { style: { display: "flex", gap: 8, alignItems: "center", fontSize: 11, color: muted } },
+            h("span", null, "导演台模型缩放"),
+            h("input", {
+                type: "range", min: 0.1, max: 30, step: 0.1, value: modelScale,
+                style: { flex: 1 },
+                onChange: (e) => setModelScale(Number(e.target.value)),
+            }),
+            h("span", null, `${modelScale}×`),
+            h("button", {
+                type: "button", style: buttonStyle,
+                onClick: () => {
+                    if (directorReadyRef.current && lastModelRef.current) pushToDirector();
+                },
+            }, "应用"),
         ),
         // 双向控制开关
         h("div", { style: { display: "flex", gap: 12, flexWrap: "wrap", fontSize: 11, color: muted } },
