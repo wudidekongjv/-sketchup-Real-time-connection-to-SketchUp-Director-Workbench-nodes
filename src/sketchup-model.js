@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@0d86b60ab9382bd85735151d84d4183136396930";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@c855882d0cee0af921cb422a7cb470dd5e2ee079";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -127,6 +127,7 @@ function SketchUpSyncContent({ ctx, React }) {
     const lastCameraRef = React.useRef(null);
     const lastBackdropRef = React.useRef(null);
     const pendingExportRef = React.useRef(null);
+    const exportTimeoutRef = React.useRef(null);
     aspectRef.current = aspect;
     autoSyncRef.current = autoSync;
 
@@ -301,6 +302,7 @@ function SketchUpSyncContent({ ctx, React }) {
                 const p = event.data?.payload;
                 if (p?.action === "export.frame" && p.requestId === pendingExportRef.current) {
                     pendingExportRef.current = null;
+                    if (exportTimeoutRef.current) { clearTimeout(exportTimeoutRef.current); exportTimeoutRef.current = null; }
                     if (p.ok && p.data?.dataUrl) {
                         exportToCanvas(p.data.dataUrl, p.data.fileName || "导演台合成.png");
                         setStatus("已回传导演台合成画面到画布");
@@ -455,21 +457,33 @@ function SketchUpSyncContent({ ctx, React }) {
         requestSnapshot(2048, false, false);
     };
 
-    // 导出导演台合成画面（底图 + 模型 + 人物），走导演台 export.frame 协议。
+    // 导出导演台合成画面（底图 + 模型 + 人物），走导演台 export.frame 协议，2048 宽。
     const exportDirectorFrame = () => {
+        if (!directorOpen) { setStatus("请先点「打开 3D 导演台」"); setError(""); return; }
         if (!directorReadyRef.current || !frameRef.current) {
-            setStatus("请先打开导演台");
+            setStatus("导演台还在加载，请等 1~2 秒再点");
             return;
         }
         const requestId = randomId("frame");
         pendingExportRef.current = requestId;
         setBusy(true);
-        setStatus("正在导出导演台合成画面（1080p）…");
+        setError("");
+        setStatus("正在导出导演台合成画面（2048）…");
         sendToDirector("storyai:director-desk:request", {
             requestId,
             action: "export.frame",
-            options: { fileName: "导演台合成.png", position: "current", quality: "1080p" },
+            options: { fileName: "导演台合成.png", position: "current", quality: "2k" },
         });
+        // 超时保护：20 秒没响应就提示。
+        if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
+        exportTimeoutRef.current = setTimeout(() => {
+            if (pendingExportRef.current === requestId) {
+                pendingExportRef.current = null;
+                setBusy(false);
+                setStatus("导出超时");
+                setError("导演台未在 20 秒内返回画面。请确认：① 导演台处于「摄像机视角」② 场景里已有机位。");
+            }
+        }, 20000);
     };
 
     const exportToCanvas = (dataUrl, fileName) => {
@@ -529,6 +543,7 @@ function SketchUpSyncContent({ ctx, React }) {
         return () => {
             if (wsRef.current) wsRef.current.close();
             if (snapTimerRef.current) clearTimeout(snapTimerRef.current);
+            if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
         };
     }, []);
 
@@ -588,7 +603,7 @@ function SketchUpSyncContent({ ctx, React }) {
         // 导演台入口 + 合成导出
         h("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
             h("button", { type: "button", style: { ...primaryStyle, background: "#7c5cff" }, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "🎬 打开 3D 导演台"),
-            h("button", { type: "button", style: { ...primaryStyle, background: "#2ea043" }, onClick: exportDirectorFrame, disabled: !directorOpen || busy }, busy ? "导出中…" : "导出合成图(1080p)"),
+            h("button", { type: "button", style: { ...primaryStyle, background: "#2ea043" }, onClick: exportDirectorFrame, disabled: !directorOpen || busy }, busy ? "导出中…" : "导出合成图(2048)"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
         ),
         // 模型缩放
