@@ -534,7 +534,28 @@ module SketchUpCanvasSync
 
       begin
         path = File.join(Dir.tmpdir, "canvas_sync_snap_#{width}.png")
+        # 关键：截图前把相机宽高比强制设为节点取景框比例，
+        # 否则 SU 视口比例（如 4:3）与节点比例（如 16:9）不一致时，
+        # 截出的画面会变形，导致底图与 3D 层无法对齐。
+        cam = view.camera
+        old_aspect = cam.aspect_ratio
+        begin
+          cam.aspect_ratio = @aspect_w.to_f / @aspect_h.to_f
+          view.invalidate
+        rescue => e
+          puts "[CanvasSync] 设置 aspect_ratio 失败：#{e.message}"
+        end
+
         ok = view.write_image(path, width, height)
+
+        # 恢复原宽高比。
+        begin
+          cam.aspect_ratio = old_aspect
+          view.invalidate
+        rescue => e
+          # 忽略
+        end
+
         unless ok && File.exist?(path)
           send_json(sock, { type: 'snapshot', error: 'write_image failed' })
           return
