@@ -32,6 +32,7 @@ module SketchUpCanvasSync
   @aspect_h = 9
   @last_model_offset = { cx: 0.0, cz: 0.0, min_y: 0.0 }
   @last_model_size = { width: 0.0, height: 0.0, depth: 0.0 }
+  @suppress_broadcast_until = nil
 
   class << self
     def running?
@@ -192,6 +193,7 @@ module SketchUpCanvasSync
       case msg['type']
       when 'get_camera'       then send_json(sock, camera_payload)
       when 'snapshot'         then send_snapshot(sock, msg['width'].to_i, msg['hide_selection'] == true)
+      when 'set_camera'       then set_camera_from_host(msg)
       when 'send_selection'   then send_selection_glb(sock)
       when 'set_aspect'
         @aspect_w = msg['w'].to_i if msg['w'].to_i > 0
@@ -242,9 +244,39 @@ module SketchUpCanvasSync
       ]
     end
 
+    # 反向控制：把 glTF 坐标转回 SketchUp 坐标，设置当前相机。
+    # 逆变换：SU.x = g.x, SU.y = -g.z, SU.z = g.y；米 → 英寸。
+    def set_camera_from_host(msg)
+      model = Sketchup.active_model
+      return unless model
+      eye = msg['eye']
+      target = msg['target']
+      return unless eye && target && eye.length >= 3 && target.length >= 3
+
+      view = model.active_view
+      cam = view.camera
+      inv = 1.0 / INCH_TO_METER
+      eye_su = Geom::Point3d.new(eye[0].to_f * inv, -eye[2].to_f * inv, eye[1].to_f * inv)
+      target_su = Geom::Point3d.new(target[0].to_f * inv, -target[2].to_f * inv, target[1].to_f * inv)
+      up = Geom::Vector3d.new(0, 0, 1)
+
+      # 抑制本轮广播，避免回环。
+      @suppress_broadcast_until = Time.now + 0.6
+      cam.set(eye_su, target_su, up)
+      fov = msg['fov']
+      cam.fov = fov.to_f if fov && fov.to_f > 0 && cam.perspective?
+      view.invalidate
+    rescue => e
+      puts "[CanvasSync] set_camera 失败：#{e.class}: #{e.message}"
+    end
+
     def broadcast_camera
       return unless @running
       return if @clients.empty?
+      # 反向控制期间抑制广播，避免 SU↔导演台 死循环。
+      if @suppress_broadcast_until && Time.now < @suppress_broadcast_until
+        return
+      end
       payload = JSON.generate(camera_payload)
       @mutex.synchronize do
         @clients.each { |c| send_frame(c[:socket], 0x81, payload) if c[:handshaken] }

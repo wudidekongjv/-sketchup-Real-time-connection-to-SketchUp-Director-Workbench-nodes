@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@e21018c73a8240e5dc0ce3a351c950fb9bf58304";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@3a3adb986b2f674a27c1c763a9364050e5e32e61";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -90,6 +90,9 @@ function SketchUpSyncContent({ ctx, React }) {
     const [busy, setBusy] = React.useState(false);
     const [directorOpen, setDirectorOpen] = React.useState(false);
     const [directorStatus, setDirectorStatus] = React.useState("");
+    const [followSu, setFollowSu] = React.useState(false); // 导演台是否跟随 SU 视角（默认关，避免锁死）
+    const followRef = React.useRef(false);
+    followRef.current = followSu;
 
     const ctxRef = React.useRef(ctx);
     ctxRef.current = ctx;
@@ -235,7 +238,7 @@ function SketchUpSyncContent({ ctx, React }) {
         }
         const c = lastCameraRef.current;
         if (c?.eye && c?.target) {
-            sendToDirector("storyai:director-desk-camera", { eye: c.eye, target: c.target, fov: c.fov });
+            sendToDirector("storyai:director-desk-camera", { eye: c.eye, target: c.target, fov: c.fov, follow: followRef.current });
         }
     };
 
@@ -278,6 +281,17 @@ function SketchUpSyncContent({ ctx, React }) {
                 setDirectorStatus(`已回传 ${caps.length} 张导演台截图`);
             } else if (type === "storyai:director-desk-close") {
                 closeDirector();
+            } else if (type === "storyai:director-desk-viewport-changed") {
+                // 反向控制：导演台视角变化 → 回写 SketchUp 相机。
+                const p = event.data?.payload;
+                if (p?.eye && p?.target && wsRef.current?.readyState === 1) {
+                    wsRef.current.send(JSON.stringify({
+                        type: "set_camera",
+                        eye: p.eye,
+                        target: p.target,
+                        fov: p.fov,
+                    }));
+                }
             }
         };
         window.addEventListener("message", handleMessage);
@@ -345,7 +359,9 @@ function SketchUpSyncContent({ ctx, React }) {
                 scheduleSnapshot();
                 // 转发给导演台（若已打开）：实现导演台实时跟随 SU 视角。
                 if (directorReadyRef.current) {
-                    sendToDirector("storyai:director-desk-camera", { eye: msg.eye, target: msg.target, fov: msg.fov });
+                    sendToDirector("storyai:director-desk-camera", {
+                        eye: msg.eye, target: msg.target, fov: msg.fov, follow: followRef.current,
+                    });
                 }
             }
             return;
@@ -501,9 +517,17 @@ function SketchUpSyncContent({ ctx, React }) {
         ),
 
         // 导演台入口
-        h("div", { style: { display: "flex", gap: 6, alignItems: "center" } },
+        h("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
             h("button", { type: "button", style: { ...primaryStyle, background: "#7c5cff" }, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "🎬 打开 3D 导演台"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
+        ),
+        // 双向控制开关
+        h("div", { style: { display: "flex", gap: 12, flexWrap: "wrap", fontSize: 11, color: muted } },
+            h("label", { style: { display: "flex", alignItems: "center", gap: 5 } },
+                h("input", { type: "checkbox", checked: followSu, onChange: (e) => setFollowSu(e.target.checked) }),
+                "导演台跟随 SU 视角",
+            ),
+            h("span", { style: { opacity: 0.7 } }, "（导演台转视角会自动回写 SU）"),
         ),
 
         h("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: muted } },
