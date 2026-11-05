@@ -279,29 +279,27 @@ module SketchUpCanvasSync
     end
 
     def build_glb(faces)
-      # 遍历所有面，收集顶点/索引/颜色。
-      positions = []   # [x,y,z] 米
-      indices = []     # 三角形索引
-      colors = []      # 每顶点颜色（材质 diffuse）
+      # 第一步：收集所有面的顶点（SketchUp 世界坐标，英寸）。
+      raw_positions = []   # 每顶点 [x,y,z]（英寸，SketchUp Z-up）
+      indices = []         # 三角形索引
+      colors = []          # 每顶点颜色
       vertex_map = {}
-      materials_cache = {}
 
       faces.each do |face, transform|
         mesh = face.mesh(Geom::PolygonMesh::MESH_POINTS)
         color = face_color(face)
         mesh.polygons.each do |poly|
-          tri = triangulate(poly)
-          tri.each do |idx|
+          triangulate(poly).each do |raw_idx|
+            # SketchUp 的负索引表示隐藏边，取绝对值才是顶点索引。
+            idx = raw_idx.abs
             pt = mesh.point_at(idx)
             p = pt.transform(transform)
             key = [p.x.round(4), p.y.round(4), p.z.round(4)]
             vi = vertex_map[key]
             unless vi
-              vi = positions.length / 3
+              vi = raw_positions.length
               vertex_map[key] = vi
-              positions << p.x.to_f * INCH_TO_METER
-              positions << p.y.to_f * INCH_TO_METER
-              positions << p.z.to_f * INCH_TO_METER
+              raw_positions << [p.x.to_f, p.y.to_f, p.z.to_f]
               colors << color[0] << color[1] << color[2]
             end
             indices << vi
@@ -309,7 +307,27 @@ module SketchUpCanvasSync
         end
       end
 
-      return nil if positions.empty?
+      return nil if raw_positions.empty?
+
+      # 第二步：坐标轴转换 + 居中 + 英寸→米。
+      # SketchUp 是 Z-up（X右 Y前 Z上），glTF/Three.js 是 Y-up（X右 Y上 Z朝观察者）。
+      # 映射：glTF.x = SU.x, glTF.y = SU.z, glTF.z = -SU.y
+      converted = raw_positions.map { |(x, y, z)| [x, z, -y] }
+
+      # 计算包围盒：X/Z 居中，Y 底部贴地（Y=0），这样模型和人偶站在同一地面。
+      xs = converted.map { |v| v[0] }
+      ys = converted.map { |v| v[1] }
+      zs = converted.map { |v| v[2] }
+      cx = (xs.min + xs.max) / 2.0
+      cz = (zs.min + zs.max) / 2.0
+      min_y = ys.min
+
+      positions = []
+      converted.each do |(x, y, z)|
+        positions << (x - cx) * INCH_TO_METER
+        positions << (y - min_y) * INCH_TO_METER
+        positions << (z - cz) * INCH_TO_METER
+      end
 
       build_glb_binary(positions, indices, colors)
     end
