@@ -1,6 +1,10 @@
 # frozen_string_literal: true
 # CanvasSync 实际逻辑 —— 由主文件 sketchup-canvas-sync.rb 加载。
-# 通信：本地 WebSocket 服务（127.0.0.1:8899），带完整帧缓冲与状态机。
+# 功能：
+#   1) 选中模型 → 导出 glb → 通过 WebSocket 发给画布
+#   2) 相机参数实时同步（eye/target/up/fov/aspect，英寸→米）
+#   3) 截图按需输出
+# 通信：本地 WebSocket 服务（127.0.0.1:8899）
 
 require 'sketchup.rb'
 require 'socket'
@@ -13,12 +17,17 @@ module SketchUpCanvasSync
   HOST = '127.0.0.1'
   PORT = 8899
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+  INCH_TO_METER = 0.0254
+  FLOAT_PACK = 'e'          # 单精度浮点（小端）
+  UINT32_PACK = 'V'         # 32位无符号（小端）
+  UINT16_PACK = 'v'         # 16位无符号（小端）
 
   @server = nil
-  @clients = []          # 每个 client 附带 @rbuf（读缓冲）
+  @clients = []
   @mutex = Mutex.new
   @running = false
   @timer_id = nil
+  @camera_timer_id = nil
   @aspect_w = 16
   @aspect_h = 9
 
@@ -33,6 +42,7 @@ module SketchUpCanvasSync
         @server = TCPServer.new(HOST, PORT)
         @running = true
         @timer_id = UI.start_timer(0.05, true) { tick }
+        @camera_timer_id = UI.start_timer(0.3, true) { broadcast_camera }
         puts '[CanvasSync] 服务已启动 ws://127.0.0.1:8899'
       rescue => e
         @server = nil
@@ -44,7 +54,9 @@ module SketchUpCanvasSync
     def stop
       @running = false
       UI.stop_timer(@timer_id) if @timer_id
+      UI.stop_timer(@camera_timer_id) if @camera_timer_id
       @timer_id = nil
+      @camera_timer_id = nil
       @mutex.synchronize do
         @clients.each { |c| c[:socket].close rescue nil }
         @clients.clear
@@ -58,7 +70,7 @@ module SketchUpCanvasSync
       running? ? stop : start
     end
 
-    # ── 主循环（50ms 一次）──
+    # ── 主循环 ──
     def tick
       return unless @running
       accept_clients
@@ -79,7 +91,7 @@ module SketchUpCanvasSync
         @mutex.synchronize do
           @clients << { socket: sock, rbuf: ''.b, handshaken: false }
         end
-        puts "[CanvasSync] TCP 客户端连接：#{sock.peeraddr[3]}"
+        puts "[CanvasSync] 客户端连接：#{sock.peeraddr[3]}"
       end
     end
 
@@ -100,10 +112,8 @@ module SketchUpCanvasSync
       end
     end
 
-    # 处理某个连接的读缓冲：先握手，后解析帧。
     def process_buffer(c)
       sock = c[:socket]
-      # 1) 未握手：等待完整的 HTTP 请求头（\r\n\r\n 结尾）。
       unless c[:handshaken]
         idx = c[:rbuf].index("\r\n\r\n")
         return unless idx
@@ -112,12 +122,10 @@ module SketchUpCanvasSync
         do_handshake(sock, header)
         c[:handshaken] = true
       end
-      # 2) 解析帧（循环，直到缓冲里没有完整帧）。
       loop do
         frame = extract_frame(c[:rbuf])
         break unless frame
-        opcode, payload = frame
-        dispatch(sock, opcode, payload)
+        dispatch(sock, frame[0], frame[1])
       end
     end
 
@@ -133,7 +141,6 @@ module SketchUpCanvasSync
       puts '[CanvasSync] WebSocket 握手完成'
     end
 
-    # 从缓冲提取一个完整帧，返回 [opcode, payload]；缓冲不足返回 nil。
     def extract_frame(buf)
       return nil if buf.bytesize < 2
       b0 = buf.getbyte(0)
@@ -160,7 +167,6 @@ module SketchUpCanvasSync
       return nil if buf.bytesize < offset + len
       payload = buf.byteslice(offset, len)
       payload = unmask(payload, mask) if masked && mask
-      # 从缓冲移除这一帧。
       rest = buf.byteslice(offset + len, buf.bytesize - offset - len) || ''.b
       buf.replace(rest)
       [opcode, payload]
@@ -173,30 +179,28 @@ module SketchUpCanvasSync
 
     def dispatch(sock, opcode, payload)
       case opcode
-      when 0x8 # close
-        remove_client_by_socket(sock)
-      when 0x9 # ping -> pong
-        send_frame(sock, 0x8A, payload)
-      when 0x1, 0x0 # text / continuation
-        handle_command(sock, payload.force_encoding('UTF-8'))
+      when 0x8 then remove_client_by_socket(sock)
+      when 0x9 then send_frame(sock, 0x8A, payload)
+      when 0x1, 0x0 then handle_command(sock, payload.force_encoding('UTF-8'))
       end
     end
 
     def handle_command(sock, text)
       msg = JSON.parse(text) rescue {}
       case msg['type']
-      when 'get_camera'   then send_json(sock, camera_payload)
-      when 'snapshot'     then send_snapshot(sock, msg['width'].to_i)
-      when 'get_models'   then send_json(sock, models_payload)
-      when 'get_scenes'   then send_json(sock, scenes_payload)
+      when 'get_camera'       then send_json(sock, camera_payload)
+      when 'snapshot'         then send_snapshot(sock, msg['width'].to_i)
+      when 'send_selection'   then send_selection_glb(sock)
       when 'set_aspect'
         @aspect_w = msg['w'].to_i if msg['w'].to_i > 0
         @aspect_h = msg['h'].to_i if msg['h'].to_i > 0
       end
     rescue => e
       puts "[CanvasSync] 命令处理失败：#{e.class}: #{e.message}"
+      send_json(sock, { type: 'error', message: "#{e.class}: #{e.message}" }) rescue nil
     end
 
+    # ── 相机 ──
     def camera_payload
       model = Sketchup.active_model
       return { type: 'camera', error: 'no_model' } unless model
@@ -206,8 +210,8 @@ module SketchUpCanvasSync
       up = cam.up
       {
         type: 'camera',
-        eye: [eye.x.to_f, eye.y.to_f, eye.z.to_f],
-        target: [target.x.to_f, target.y.to_f, target.z.to_f],
+        eye: [eye.x.to_f * INCH_TO_METER, eye.y.to_f * INCH_TO_METER, eye.z.to_f * INCH_TO_METER],
+        target: [target.x.to_f * INCH_TO_METER, target.y.to_f * INCH_TO_METER, target.z.to_f * INCH_TO_METER],
         up: [up.x.to_f, up.y.to_f, up.z.to_f],
         fov: cam.fov.to_f,
         aspect_ratio: cam.aspect_ratio.to_f,
@@ -217,28 +221,204 @@ module SketchUpCanvasSync
       { type: 'camera', error: e.message }
     end
 
-    def models_payload
-      model = Sketchup.active_model
-      return { type: 'models', items: [] } unless model
-      items = []
-      model.definitions.each do |defn|
-        next if defn.image? || defn.group?
-        items << { name: defn.name, type: 'component', instances: defn.instances.length }
+    def broadcast_camera
+      return unless @running
+      return if @clients.empty?
+      payload = JSON.generate(camera_payload)
+      @mutex.synchronize do
+        @clients.each { |c| send_frame(c[:socket], 0x81, payload) if c[:handshaken] }
       end
-      { type: 'models', items: items }
     rescue => e
-      { type: 'models', items: [], error: e.message }
+      # 忽略广播错误
     end
 
-    def scenes_payload
+    # ── glb 导出 ──
+    def send_selection_glb(sock)
       model = Sketchup.active_model
-      return { type: 'scenes', items: [] } unless model
-      items = model.pages.map(&:name)
-      { type: 'scenes', items: items }
+      sel = model.selection
+      if sel.empty?
+        send_json(sock, { type: 'model', error: 'no_selection' })
+        return
+      end
+
+      # 收集所有选中实体里的面（含组件实例）。
+      faces = []
+      sel.each do |entity|
+        collect_faces(entity, Geom::Transformation.new, faces)
+      end
+
+      if faces.empty?
+        send_json(sock, { type: 'model', error: 'no_faces' })
+        return
+      end
+
+      glb = build_glb(faces)
+      b64 = Base64.strict_encode64(glb)
+      send_json(sock, {
+        type: 'model',
+        name: model.name || 'SketchUp模型',
+        mime: 'model/gltf-binary',
+        size: glb.bytesize,
+        data: b64,
+      })
+      puts "[CanvasSync] 已导出 #{faces.length} 个面的 glb（#{glb.bytesize} 字节）"
     rescue => e
-      { type: 'scenes', items: [], error: e.message }
+      puts "[CanvasSync] glb 导出失败：#{e.class}: #{e.message}"
+      send_json(sock, { type: 'model', error: e.message })
     end
 
+    def collect_faces(entity, transform, out)
+      if entity.is_a?(Sketchup::Face)
+        out << [entity, transform]
+      elsif entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
+        t = transform * entity.transformation
+        entity.definition.entities.each do |e|
+          collect_faces(e, t, out)
+        end
+      end
+    end
+
+    def build_glb(faces)
+      # 遍历所有面，收集顶点/索引/颜色。
+      positions = []   # [x,y,z] 米
+      indices = []     # 三角形索引
+      colors = []      # 每顶点颜色（材质 diffuse）
+      vertex_map = {}
+      materials_cache = {}
+
+      faces.each do |face, transform|
+        mesh = face.mesh(Geom::PolygonMesh::MESH_POINTS)
+        color = face_color(face)
+        mesh.polygons.each do |poly|
+          tri = triangulate(poly)
+          tri.each do |idx|
+            pt = mesh.point_at(idx)
+            p = pt.transform(transform)
+            key = [p.x.round(4), p.y.round(4), p.z.round(4)]
+            vi = vertex_map[key]
+            unless vi
+              vi = positions.length / 3
+              vertex_map[key] = vi
+              positions << p.x.to_f * INCH_TO_METER
+              positions << p.y.to_f * INCH_TO_METER
+              positions << p.z.to_f * INCH_TO_METER
+              colors << color[0] << color[1] << color[2]
+            end
+            indices << vi
+          end
+        end
+      end
+
+      return nil if positions.empty?
+
+      build_glb_binary(positions, indices, colors)
+    end
+
+    def face_color(face)
+      mat = face.material || face.back_material
+      if mat && mat.color
+        c = mat.color
+        return [(c.red / 255.0), (c.green / 255.0), (c.blue / 255.0)]
+      end
+      [0.8, 0.8, 0.8]
+    end
+
+    # 简单三角化（扇形）。
+    def triangulate(poly)
+      return [] if poly.length < 3
+      tris = []
+      (1..(poly.length - 2)).each do |i|
+        tris << poly[0] << poly[i] << poly[i + 1]
+      end
+      tris
+    end
+
+    def build_glb_binary(positions, indices, colors)
+      # 组装 glTF 2.0 的 JSON。
+      # buffer 布局：[positions(12字节/顶点)][indices(4字节/索引)][colors(12字节/顶点)]
+      pos_count = positions.length / 3
+      idx_count = indices.length
+      col_count = colors.length / 3
+
+      pos_byte_len = positions.length * 4
+      idx_byte_len = idx_count * 4
+      col_byte_len = colors.length * 4
+      total_bin = pos_byte_len + idx_byte_len + col_byte_len
+
+      # 对齐到 4 字节。
+      total_bin = (total_bin + 3) & ~3
+
+      json = {
+        asset: { version: '2.0', generator: 'CanvasSync' },
+        scene: 0,
+        scenes: [{ nodes: [0] }],
+        nodes: [{ mesh: 0, name: 'SketchUpModel' }],
+        meshes: [{
+          primitives: [{
+            attributes: {
+              POSITION: 0,
+              COLOR_0: 2
+            },
+            indices: 1,
+            mode: 4
+          }]
+        }],
+        accessors: [
+          { bufferView: 0, componentType: 5126, count: pos_count, type: 'VEC3', min: min3(positions), max: max3(positions) },
+          { bufferView: 1, componentType: 5125, count: idx_count, type: 'SCALAR' },
+          { bufferView: 2, componentType: 5126, count: col_count, type: 'VEC3' }
+        ],
+        bufferViews: [
+          { buffer: 0, byteOffset: 0, byteLength: pos_byte_len, target: 34962 },
+          { buffer: 0, byteOffset: pos_byte_len, byteLength: idx_byte_len, target: 34963 },
+          { buffer: 0, byteOffset: pos_byte_len + idx_byte_len, byteLength: col_byte_len, target: 34962 }
+        ],
+        buffers: [{ byteLength: total_bin }]
+      }
+
+      # 组装二进制 buffer。
+      bin = String.new(capacity: total_bin, encoding: 'BINARY')
+      positions.each { |v| bin << [v].pack(FLOAT_PACK) }
+      indices.each { |i| bin << [i].pack(UINT32_PACK) }
+      colors.each { |v| bin << [v].pack(FLOAT_PACK) }
+      # 填充到 4 字节对齐。
+      while bin.bytesize < total_bin
+        bin << "\x00".b
+      end
+
+      json_str = JSON.generate(json)
+      json_bytes = json_str.bytes
+      # JSON chunk 也要 4 字节对齐（补空格）。
+      while json_bytes.length % 4 != 0
+        json_bytes << 0x20
+      end
+
+      # glb header + chunks。
+      glb = String.new(encoding: 'BINARY')
+      glb << [0x46546C67].pack(UINT32_PACK)      # magic 'glTF'
+      glb << [2].pack(UINT32_PACK)               # version 2
+      glb << [12 + 8 + json_bytes.length + 8 + total_bin].pack(UINT32_PACK)  # total length
+
+      glb << [json_bytes.length].pack(UINT32_PACK)   # JSON chunk length
+      glb << [0x4E4F534A].pack(UINT32_PACK)          # chunk type 'JSON'
+      glb << json_bytes.pack('C*')
+
+      glb << [total_bin].pack(UINT32_PACK)           # BIN chunk length
+      glb << [0x004E4942].pack(UINT32_PACK)          # chunk type 'BIN\0'
+      glb << bin
+
+      glb
+    end
+
+    def min3(arr)
+      (0...arr.length/3).map { |i| [arr[i*3], arr[i*3+1], arr[i*3+2]] }.transpose.map(&:min)
+    end
+
+    def max3(arr)
+      (0...arr.length/3).map { |i| [arr[i*3], arr[i*3+1], arr[i*3+2]] }.transpose.map(&:max)
+    end
+
+    # ── 截图 ──
     def send_snapshot(sock, width)
       width = 320 if width <= 0
       model = Sketchup.active_model
@@ -262,6 +442,7 @@ module SketchUpCanvasSync
       send_json(sock, { type: 'snapshot', error: e.message })
     end
 
+    # ── 发送 ──
     def send_json(sock, obj)
       send_frame(sock, 0x81, JSON.generate(obj))
     end
@@ -293,10 +474,20 @@ module SketchUpCanvasSync
     end
   end
 
-  # ── 菜单（注意：UI.menu 需要英文菜单名 'Plugins'，SketchUp 会自动显示为「扩展程序」）──
+  # ── 菜单 ──
   unless file_loaded?(__FILE__)
     menu = UI.menu('Plugins').add_submenu('CanvasSync')
     menu.add_item('启动/停止同步服务') { toggle }
+    menu.add_item('发送选中模型') {
+      start unless running?
+      sleep 0.2
+      sock = @clients.find { |c| c[:handshaken] }&.dig(:socket)
+      if sock
+        send_selection_glb(sock)
+      else
+        UI.messagebox('没有连接的画布客户端。请先在画布创建 SketchUp 同步节点。')
+      end
+    }
     file_loaded(__FILE__)
   end
 end
