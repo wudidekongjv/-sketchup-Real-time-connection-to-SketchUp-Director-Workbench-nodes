@@ -1,0 +1,14 @@
+{
+    "name": "infinite-canvas-sketchup-connection-node",
+    "version": "0.1.0",
+    "private": false,
+    "type": "module",
+    "description": "Infinite Canvas 与 SketchUp 实时联动的工作台节点插件",
+    "scripts": {
+        "build": "node build.mjs",
+        "typecheck": "node --check src/sketchup-sync.js"
+    },
+    "devDependencies": {
+        "esbuild": "^0.25.0"
+    }
+}
