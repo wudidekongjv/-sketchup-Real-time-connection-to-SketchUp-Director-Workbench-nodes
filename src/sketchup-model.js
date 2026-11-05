@@ -1,10 +1,7 @@
 // Infinite Canvas SketchUp ↔ 导演台 联动节点。
-// 功能：
-//   1) 连接本地 ws://127.0.0.1:8899（SketchUp Ruby 插件）
-//   2) 接收 SketchUp 选中的模型（glb base64）
-//   3) 打开改造版 3D 导演台 iframe，把模型作为 prop 注入场景
-//   4) 导演台截图回传画布（供 AI 生图保持场景一致）
-// 导演台 = xiaozangao/3d-director-desk 改造版（新增 model 注入协议），部署在 jsDelivr。
+// 照原 director 插件的方式：动态 fetch 改造版导演台（单文件 bundle）的 HTML + JS，
+// 改写成 srcdoc 内联 iframe，避免跨域，也无需用户单独部署导演台。
+// 然后通过 WebSocket 接收 SketchUp 模型，postMessage 注入导演台为 prop。
 
 const WS_URL = "ws://127.0.0.1:8899";
 const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@main";
@@ -12,6 +9,60 @@ const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@ma
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function cacheBusted(url) {
+    return `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+}
+
+async function fetchText(url) {
+    const response = await fetch(cacheBusted(url), { cache: "no-store" });
+    if (!response.ok) throw new Error(`导演台资源下载失败 (${response.status})`);
+    return response.text();
+}
+
+// 把导演台里的相对资源路径改写成 CDN 绝对路径（jsDelivr 上可访问）。
+function rewriteDirectorScript(source, hostOrigin) {
+    return source
+        // 把 window.location.origin 指向宿主 origin（srcdoc 里 origin 是 null）。
+        .replace(/window\.location\.origin/g, JSON.stringify(hostOrigin))
+        // 把 /src/ 等开发路径兜底（一般构建产物已处理，这里保留保险）。
+        .replace(/window\.location\.href/g, JSON.stringify(`${DIRECTOR_BASE}/index.html`));
+}
+
+async function prepareDirectorFrame(hostOrigin) {
+    const html = await fetchText(`${DIRECTOR_BASE}/index.html`);
+    const scriptMatch = html.match(/<script[^>]+src=["']([^"']+)["'][^>]*>/i);
+    const styleMatch = html.match(/<link[^>]+href=["']([^"']+)["'][^>]*>/i);
+    if (!scriptMatch) throw new Error("导演台页面缺少脚本入口");
+
+    const scriptPath = scriptMatch[1];
+    const scriptUrl = scriptPath.startsWith("http")
+        ? scriptPath
+        : scriptPath.startsWith("./")
+            ? `${DIRECTOR_BASE}/${scriptPath.slice(2)}`
+            : `${DIRECTOR_BASE}/${scriptPath.replace(/^\//, "")}`;
+
+    const scriptSource = rewriteDirectorScript(await fetchText(scriptUrl), hostOrigin);
+
+    const stylePath = styleMatch?.[1];
+    const styleUrl = stylePath
+        ? (stylePath.startsWith("http")
+            ? stylePath
+            : stylePath.startsWith("./")
+                ? `${DIRECTOR_BASE}/${stylePath.slice(2)}`
+                : `${DIRECTOR_BASE}/${stylePath.replace(/^\//, "")}`)
+        : null;
+
+    // 防止 </script> 终止内联。
+    const safeScriptSource = scriptSource.replace(/<\/script/gi, "<" + String.fromCharCode(92) + "/script");
+    const inlineScript = `<script type="module">${safeScriptSource}</script>`;
+
+    const frameHtml = html
+        .replace(scriptMatch[0], () => inlineScript)
+        .replace(styleMatch?.[0] || "", () => styleUrl ? `<link rel="stylesheet" href="${styleUrl}">` : "");
+
+    return { html: frameHtml, dispose: () => {} };
 }
 
 function SketchUpDirectorContent({ ctx, React }) {
@@ -22,7 +73,7 @@ function SketchUpDirectorContent({ ctx, React }) {
     const [error, setError] = React.useState("");
     const [modelInfo, setModelInfo] = React.useState(null);
     const [directorOpen, setDirectorOpen] = React.useState(false);
-    const [pendingModel, setPendingModel] = React.useState(null); // { name, fileName, base64 }
+    const [loading, setLoading] = React.useState("");
 
     const ctxRef = React.useRef(ctx);
     ctxRef.current = ctx;
@@ -32,7 +83,7 @@ function SketchUpDirectorContent({ ctx, React }) {
     const directorReadyRef = React.useRef(false);
     const pendingModelRef = React.useRef(null);
 
-    // ── WebSocket：接收 SketchUp 数据 ──
+    // ── WebSocket ──
     const connect = () => {
         setError("");
         setStatus("连接中…");
@@ -45,16 +96,10 @@ function SketchUpDirectorContent({ ctx, React }) {
                 ws.send(JSON.stringify({ type: "get_camera" }));
             };
             ws.onmessage = (event) => {
-                try {
-                    const msg = JSON.parse(event.data);
-                    handleSketchUpMessage(msg);
-                } catch (_e) { /* 非 JSON */ }
+                try { handleSketchUpMessage(JSON.parse(event.data)); } catch (_e) {}
             };
             ws.onerror = () => setError("连接出错（请确认 SketchUp 已启动 CanvasSync 服务）");
-            ws.onclose = () => {
-                setConnected(false);
-                setStatus("已断开");
-            };
+            ws.onclose = () => { setConnected(false); setStatus("已断开"); };
         } catch (err) {
             setStatus("连接失败");
             setError(err instanceof Error ? err.message : String(err));
@@ -66,10 +111,8 @@ function SketchUpDirectorContent({ ctx, React }) {
             if (msg.data) {
                 const model = { name: msg.name || "SketchUp模型", fileName: "sketchup-model.glb", base64: msg.data, size: msg.size };
                 setModelInfo(model);
-                setPendingModel(model);
                 pendingModelRef.current = model;
                 setStatus(`收到模型：${model.name}（${(msg.size / 1024).toFixed(1)} KB）`);
-                // 如果导演台已打开且就绪，立即注入；否则等打开后注入。
                 injectModelIfReady();
             } else if (msg.error) {
                 setError(`模型导出失败：${msg.error}`);
@@ -77,43 +120,35 @@ function SketchUpDirectorContent({ ctx, React }) {
         }
     };
 
-    // ── 导演台 iframe ──
+    // ── 导演台（srcdoc 内联，照原插件方式）──
     const openDirector = () => {
         if (directorOpen) return;
+        setLoading("正在加载 3D 导演台…");
         const origin = window.location.origin;
-        const instanceId = `sketchup-${ctxRef.current.node.id}`;
-        const src = `${DIRECTOR_BASE}/index.html?instanceId=${encodeURIComponent(instanceId)}&hostOrigin=${encodeURIComponent(origin)}&theme=dark`;
 
         const overlay = document.createElement("div");
         overlay.style.cssText = "position:fixed;inset:0;z-index:2147483000;background:#090909";
+        const loadingDiv = document.createElement("div");
+        loadingDiv.textContent = loading;
+        loadingDiv.style.cssText = "position:absolute;inset:0;display:grid;place-items:center;color:#fff;font:14px system-ui,sans-serif;z-index:1";
+        overlay.appendChild(loadingDiv);
         document.body.appendChild(overlay);
         overlayRef.current = overlay;
 
-        const iframe = document.createElement("iframe");
-        iframe.title = "3D导演台";
-        iframe.allow = "fullscreen";
-        iframe.referrerPolicy = "no-referrer";
-        iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0";
-        iframe.src = src;
-        overlay.appendChild(iframe);
-        frameRef.current = iframe;
-
         const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
         closeBtn.textContent = "关闭导演台";
         closeBtn.style.cssText = "position:absolute;right:16px;top:12px;z-index:2;border:1px solid #ffffff44;border-radius:8px;padding:6px 10px;background:#0008;color:#fff;cursor:pointer";
         closeBtn.onclick = closeDirector;
         overlay.appendChild(closeBtn);
 
-        setDirectorOpen(true);
-        setStatus("导演台已打开，等待加载…");
-
-        // 监听导演台消息。
         const handleMessage = (event) => {
             const frame = frameRef.current;
             if (!frame || event.source !== frame.contentWindow) return;
             const type = event.data?.type;
             if (type === "storyai:director-desk-ready") {
                 directorReadyRef.current = true;
+                loadingDiv.remove();
                 setStatus("导演台就绪 ✅");
                 injectModelIfReady();
             } else if (type === "storyai:director-desk-captures-sent") {
@@ -130,6 +165,24 @@ function SketchUpDirectorContent({ ctx, React }) {
         };
         window.addEventListener("message", handleMessage);
         overlayRef.current._cleanup = () => window.removeEventListener("message", handleMessage);
+
+        setDirectorOpen(true);
+
+        void (async () => {
+            try {
+                const prepared = await prepareDirectorFrame(origin);
+                const frame = document.createElement("iframe");
+                frame.title = "3D导演台";
+                frame.allow = "fullscreen";
+                frame.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0";
+                frame.srcdoc = prepared.html;
+                overlay.appendChild(frame);
+                frameRef.current = frame;
+            } catch (err) {
+                loadingDiv.textContent = `导演台加载失败：${err instanceof Error ? err.message : String(err)}`;
+                setStatus("加载失败");
+            }
+        })();
     };
 
     const closeDirector = () => {
@@ -144,13 +197,12 @@ function SketchUpDirectorContent({ ctx, React }) {
     };
 
     const sendToDirector = (type, payload) => {
-        frameRef.current?.contentWindow?.postMessage({ type, payload }, "*");
+        frameRef.current?.contentWindow?.postMessage({ type, payload }, window.location.origin);
     };
 
     const injectModelIfReady = () => {
         const model = pendingModelRef.current;
         if (!model || !directorReadyRef.current || !frameRef.current) return;
-        // 注入模型（base64 → dataUrl）。
         const dataUrl = `data:model/gltf-binary;base64,${model.base64}`;
         sendToDirector("storyai:director-desk-model", {
             sourceNodeId: ctxRef.current.node.id,
@@ -172,13 +224,7 @@ function SketchUpDirectorContent({ ctx, React }) {
             const hgt = img.naturalHeight || 600;
             const scale = Math.min(1, 500 / Math.max(w, 1));
             ctxRef.current.applyOps([
-                {
-                    type: "add_node", id, nodeType: "image",
-                    title: fileName || "导演台截图.png",
-                    x: node.position.x + node.width + 96, y: node.position.y,
-                    width: Math.max(120, Math.round(w * scale)), height: Math.max(90, Math.round(hgt * scale)),
-                    metadata: { content: dataUrl, status: "success", naturalWidth: w, naturalHeight: hgt, mimeType: "image/png" },
-                },
+                { type: "add_node", id, nodeType: "image", title: fileName || "导演台截图.png", x: node.position.x + node.width + 96, y: node.position.y, width: Math.max(120, Math.round(w * scale)), height: Math.max(90, Math.round(hgt * scale)), metadata: { content: dataUrl, status: "success", naturalWidth: w, naturalHeight: hgt, mimeType: "image/png" } },
                 { type: "connect_nodes", fromNodeId: node.id, toNodeId: id },
             ]);
         };
@@ -187,18 +233,13 @@ function SketchUpDirectorContent({ ctx, React }) {
 
     React.useEffect(() => {
         connect();
-        return () => {
-            if (wsRef.current) wsRef.current.close();
-            closeDirector();
-        };
+        return () => { if (wsRef.current) wsRef.current.close(); closeDirector(); };
     }, []);
 
     const muted = ctx.theme.node.muted;
     const text = ctx.theme.node.text;
     const stroke = ctx.theme.node.stroke;
-    const buttonStyle = {
-        border: `1px solid ${stroke}`, borderRadius: 8, padding: "6px 12px", background: ctx.theme.toolbar.itemHover, color: text, cursor: "pointer", fontSize: 12,
-    };
+    const buttonStyle = { border: `1px solid ${stroke}`, borderRadius: 8, padding: "6px 12px", background: ctx.theme.toolbar.itemHover, color: text, cursor: "pointer", fontSize: 12 };
     const primaryStyle = { ...buttonStyle, background: ctx.theme.accent || "#4c8dff", color: "#fff", fontWeight: 600 };
 
     return h(
@@ -214,23 +255,14 @@ function SketchUpDirectorContent({ ctx, React }) {
             h("button", { type: "button", style: primaryStyle, onClick: connect, disabled: connected }, connected ? "已连接" : "连接 SketchUp"),
             h("button", { type: "button", style: primaryStyle, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "打开导演台"),
         ),
-        modelInfo
-            ? h("div", { style: { fontSize: 11, color: muted } }, `已接收模型：${modelInfo.name}（${(modelInfo.size / 1024).toFixed(1)} KB）`)
-            : null,
+        modelInfo ? h("div", { style: { fontSize: 11, color: muted } }, `已接收模型：${modelInfo.name}（${(modelInfo.size / 1024).toFixed(1)} KB）`) : null,
         h("div", { style: { fontSize: 11, color: muted, lineHeight: 1.6 } },
-            "使用步骤：",
-            h("br"),
-            "1. SketchUp 菜单「扩展程序 → CanvasSync → 启动服务」",
-            h("br"),
-            "2. 本节点点「连接 SketchUp」",
-            h("br"),
-            "3. SketchUp 里选中模型 → 「CanvasSync → 发送选中模型」",
-            h("br"),
-            "4. 点「打开导演台」，模型会自动注入为场景道具",
-            h("br"),
-            "5. 在导演台里布置人物/机位/动作，截图自动回传画布",
+            "1. SketchUp「扩展程序 → CanvasSync → 启动服务」",
+            h("br"), "2. 本节点「连接 SketchUp」",
+            h("br"), "3. SketchUp 选中模型 →「发送选中模型」",
+            h("br"), "4. 「打开导演台」→ 模型自动注入为道具",
+            h("br"), "5. 导演台布置人物/机位/动作 → 截图回传",
         ),
-        h("div", { style: { fontSize: 10, color: muted, borderTop: `1px solid ${stroke}`, paddingTop: 6 } }, "提示：导演台保留人物/机位/动作全部功能，SketchUp 模型作为场景道具接入，保证 AI 生图场景一致。"),
     );
 }
 
@@ -239,16 +271,16 @@ export default function createSketchUpDirectorPlugin(runtime) {
     return {
         id: "sketchup-director",
         name: "SketchUp 导演台联动",
-        version: "0.2.0",
+        version: "0.3.0",
         minAppVersion: "0.12.0",
-        description: "把 SketchUp 选中模型导入 3D 导演台作为场景，保留人物/机位/动作功能，截图回传保持 AI 生图场景一致。",
+        description: "把 SketchUp 模型导入 3D 导演台（人物/机位/动作齐全），截图回传保持 AI 生图场景一致。",
         nodes: [
             {
                 type: "sketchup:director",
                 title: "SketchUp 导演台联动",
                 icon: "🏛️",
-                description: "SketchUp 模型 → 3D 导演台（人物/机位/动作）→ 截图回传",
-                defaultSize: { width: 400, height: 420 },
+                description: "SketchUp 模型 → 3D 导演台 → 截图回传",
+                defaultSize: { width: 400, height: 400 },
                 defaultMetadata: {},
                 hasSourceHandle: false,
                 hidePanel: true,
