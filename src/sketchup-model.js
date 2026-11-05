@@ -21,13 +21,13 @@ async function fetchText(url) {
     return response.text();
 }
 
-// 把导演台里的相对资源路径改写成 CDN 绝对路径（jsDelivr 上可访问）。
+// 把导演台 JS 里的 /director/ 绝对路径改写成 CDN 地址（照 esncy 插件方式），
+// 并把 window.location.origin 指向宿主 origin（srcdoc 里 origin 为 null）。
 function rewriteDirectorScript(source, hostOrigin) {
     return source
-        // 把 window.location.origin 指向宿主 origin（srcdoc 里 origin 是 null）。
-        .replace(/window\.location\.origin/g, JSON.stringify(hostOrigin))
-        // 把 /src/ 等开发路径兜底（一般构建产物已处理，这里保留保险）。
-        .replace(/window\.location\.href/g, JSON.stringify(`${DIRECTOR_BASE}/index.html`));
+        // /director/xxx → CDN 根/xxx（含字符串字面量和 import 路径）。
+        .replace(/\/director\//g, `${DIRECTOR_BASE}/`)
+        .replace(/window\.location\.origin/g, JSON.stringify(hostOrigin));
 }
 
 async function prepareDirectorFrame(hostOrigin) {
@@ -36,23 +36,14 @@ async function prepareDirectorFrame(hostOrigin) {
     const styleMatch = html.match(/<link[^>]+href=["']([^"']+)["'][^>]*>/i);
     if (!scriptMatch) throw new Error("导演台页面缺少脚本入口");
 
-    const scriptPath = scriptMatch[1];
-    const scriptUrl = scriptPath.startsWith("http")
-        ? scriptPath
-        : scriptPath.startsWith("./")
-            ? `${DIRECTOR_BASE}/${scriptPath.slice(2)}`
-            : `${DIRECTOR_BASE}/${scriptPath.replace(/^\//, "")}`;
+    // 把 /director/xxx 映射到 CDN 根/xxx（去掉 /director 前缀）。
+    const toCdn = (p) => {
+        const clean = p.replace(/^\/director\//, "").replace(/^\.\//, "");
+        return `${DIRECTOR_BASE}/${clean}`;
+    };
 
-    const scriptSource = rewriteDirectorScript(await fetchText(scriptUrl), hostOrigin);
-
-    const stylePath = styleMatch?.[1];
-    const styleUrl = stylePath
-        ? (stylePath.startsWith("http")
-            ? stylePath
-            : stylePath.startsWith("./")
-                ? `${DIRECTOR_BASE}/${stylePath.slice(2)}`
-                : `${DIRECTOR_BASE}/${stylePath.replace(/^\//, "")}`)
-        : null;
+    const scriptSource = rewriteDirectorScript(await fetchText(toCdn(scriptMatch[1])), hostOrigin);
+    const styleUrl = styleMatch ? toCdn(styleMatch[1]) : null;
 
     // 防止 </script> 终止内联。
     const safeScriptSource = scriptSource.replace(/<\/script/gi, "<" + String.fromCharCode(92) + "/script");
