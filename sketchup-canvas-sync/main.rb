@@ -30,6 +30,8 @@ module SketchUpCanvasSync
   @camera_timer_id = nil
   @aspect_w = 16
   @aspect_h = 9
+  @last_model_offset = { cx: 0.0, cz: 0.0, min_y: 0.0 }
+  @last_model_size = { width: 0.0, height: 0.0, depth: 0.0 }
 
   class << self
     def running?
@@ -201,17 +203,26 @@ module SketchUpCanvasSync
     end
 
     # ── 相机 ──
+    # 模型导出时做了 Z-up→Y-up 转换 + X/Z 居中 + Y 贴地，
+    # 相机必须用同样的变换，才能和模型对齐。
+    def sketchup_to_gltf(x, y, z)
+      [x, z, -y]
+    end
+
     def camera_payload
       model = Sketchup.active_model
       return { type: 'camera', error: 'no_model' } unless model
       cam = model.active_view.camera
-      eye = cam.eye
-      target = cam.target
+      offset = @last_model_offset || { cx: 0.0, cz: 0.0, min_y: 0.0 }
+
+      eye = transform_point(cam.eye, offset)
+      target = transform_point(cam.target, offset)
       up = cam.up
+
       {
         type: 'camera',
-        eye: [eye.x.to_f * INCH_TO_METER, eye.y.to_f * INCH_TO_METER, eye.z.to_f * INCH_TO_METER],
-        target: [target.x.to_f * INCH_TO_METER, target.y.to_f * INCH_TO_METER, target.z.to_f * INCH_TO_METER],
+        eye: eye,
+        target: target,
         up: [up.x.to_f, up.y.to_f, up.z.to_f],
         fov: cam.fov.to_f,
         aspect_ratio: cam.aspect_ratio.to_f,
@@ -219,6 +230,16 @@ module SketchUpCanvasSync
       }
     rescue => e
       { type: 'camera', error: e.message }
+    end
+
+    # 把一个 SketchUp 点按「轴转换 + 模型偏移 + 英寸→米」变成 glTF 坐标。
+    def transform_point(pt, offset)
+      gx, gy, gz = sketchup_to_gltf(pt.x.to_f, pt.y.to_f, pt.z.to_f)
+      [
+        ((gx - offset[:cx]) * INCH_TO_METER).round(4),
+        ((gy - offset[:min_y]) * INCH_TO_METER).round(4),
+        ((gz - offset[:cz]) * INCH_TO_METER).round(4),
+      ]
     end
 
     def broadcast_camera
@@ -254,14 +275,17 @@ module SketchUpCanvasSync
 
       glb = build_glb(faces)
       b64 = Base64.strict_encode64(glb)
+      size_info = @last_model_size
       send_json(sock, {
         type: 'model',
         name: model.name || 'SketchUp模型',
         mime: 'model/gltf-binary',
         size: glb.bytesize,
         data: b64,
+        bbox: size_info,
       })
-      puts "[CanvasSync] 已导出 #{faces.length} 个面的 glb（#{glb.bytesize} 字节）"
+      puts "[CanvasSync] 已导出 #{faces.length} 个面的 glb（#{glb.bytesize} 字节）" \
+           " 尺寸 #{size_info[:width].round(2)}×#{size_info[:height].round(2)}×#{size_info[:depth].round(2)} m"
     rescue => e
       puts "[CanvasSync] glb 导出失败：#{e.class}: #{e.message}"
       send_json(sock, { type: 'model', error: e.message })
@@ -328,6 +352,15 @@ module SketchUpCanvasSync
         positions << (y - min_y) * INCH_TO_METER
         positions << (z - cz) * INCH_TO_METER
       end
+
+      # 记录偏移量，供相机同步对齐使用（相机也要减同样偏移）。
+      @last_model_offset = { cx: cx, cz: cz, min_y: min_y }
+      # 记录包围盒尺寸（米），供画布显示与判断单位。
+      @last_model_size = {
+        width: (xs.max - xs.min) * INCH_TO_METER,
+        height: (ys.max - ys.min) * INCH_TO_METER,
+        depth: (zs.max - zs.min) * INCH_TO_METER,
+      }
 
       build_glb_binary(positions, indices, colors)
     end

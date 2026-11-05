@@ -5,7 +5,7 @@
 
 const WS_URL = "ws://127.0.0.1:8899";
 // 用具体 commit 固定，避免 jsDelivr 的 @main 缓存导致拿不到最新版。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@fbc52b3ad6bb8b02fada1db1535e8a3b9139cc93";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@a8d4f0a8d2290d07ad832146dc72800b36a6b0de";
 
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
@@ -66,6 +66,7 @@ function SketchUpDirectorContent({ ctx, React }) {
     const [modelInfo, setModelInfo] = React.useState(null);
     const [directorOpen, setDirectorOpen] = React.useState(false);
     const [loading, setLoading] = React.useState("");
+    const [scale, setScale] = React.useState(1);
 
     const ctxRef = React.useRef(ctx);
     ctxRef.current = ctx;
@@ -74,6 +75,7 @@ function SketchUpDirectorContent({ ctx, React }) {
     const overlayRef = React.useRef(null);
     const directorReadyRef = React.useRef(false);
     const pendingModelRef = React.useRef(null);
+    const lastCameraRef = React.useRef(null);
 
     // ── WebSocket ──
     const connect = () => {
@@ -99,12 +101,33 @@ function SketchUpDirectorContent({ ctx, React }) {
     };
 
     const handleSketchUpMessage = (msg) => {
+        if (msg.type === "camera") {
+            // 实时联动：把 SketchUp 相机转发给导演台（相机视角跟着动）。
+            lastCameraRef.current = msg;
+            if (directorReadyRef.current && frameRef.current && msg.eye && msg.target) {
+                sendToDirector("storyai:director-desk-camera", {
+                    eye: msg.eye,
+                    target: msg.target,
+                    fov: msg.fov,
+                });
+            }
+            return;
+        }
         if (msg.type === "model") {
             if (msg.data) {
-                const model = { name: msg.name || "SketchUp模型", fileName: "sketchup-model.glb", base64: msg.data, size: msg.size };
+                const model = {
+                    name: msg.name || "SketchUp模型",
+                    fileName: "sketchup-model.glb",
+                    base64: msg.data,
+                    size: msg.size,
+                    bbox: msg.bbox || null,
+                };
                 setModelInfo(model);
                 pendingModelRef.current = model;
-                setStatus(`收到模型：${model.name}（${(msg.size / 1024).toFixed(1)} KB）`);
+                const bboxText = msg.bbox
+                    ? `${msg.bbox.width.toFixed(2)}×${msg.bbox.height.toFixed(2)}×${msg.bbox.depth.toFixed(2)} m`
+                    : "";
+                setStatus(`收到模型：${model.name}（${(msg.size / 1024).toFixed(1)} KB）${bboxText ? " 尺寸 " + bboxText : ""}`);
                 injectModelIfReady();
             } else if (msg.error) {
                 setError(`模型导出失败：${msg.error}`);
@@ -143,6 +166,7 @@ function SketchUpDirectorContent({ ctx, React }) {
                 loadingDiv.remove();
                 setStatus("导演台就绪 ✅");
                 injectModelIfReady();
+                syncCameraIfReady();
             } else if (type === "storyai:director-desk-captures-sent") {
                 const captures = Array.isArray(event.data?.payload?.captures) ? event.data.payload.captures : [];
                 captures.forEach((cap) => {
@@ -202,9 +226,21 @@ function SketchUpDirectorContent({ ctx, React }) {
             fileName: model.fileName,
             modelUrl: dataUrl,
             modelFormat: "glb",
+            scale,
         });
         pendingModelRef.current = null;
-        setStatus(`已注入模型到导演台：${model.name}`);
+        setStatus(`已注入模型到导演台：${model.name}（缩放 ${scale}×）`);
+    };
+
+    // 立即把最近一次相机同步给导演台。
+    const syncCameraIfReady = () => {
+        const cam = lastCameraRef.current;
+        if (!cam || !directorReadyRef.current || !frameRef.current || !cam.eye) return;
+        sendToDirector("storyai:director-desk-camera", {
+            eye: cam.eye,
+            target: cam.target,
+            fov: cam.fov,
+        });
     };
 
     const addCaptureToCanvas = (dataUrl, fileName) => {
@@ -247,7 +283,34 @@ function SketchUpDirectorContent({ ctx, React }) {
             h("button", { type: "button", style: primaryStyle, onClick: connect, disabled: connected }, connected ? "已连接" : "连接 SketchUp"),
             h("button", { type: "button", style: primaryStyle, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "打开导演台"),
         ),
-        modelInfo ? h("div", { style: { fontSize: 11, color: muted } }, `已接收模型：${modelInfo.name}（${(modelInfo.size / 1024).toFixed(1)} KB）`) : null,
+        // 缩放控制：解决单位/尺度不匹配。
+        h("div", null,
+            h("div", { style: { fontSize: 11, color: muted, marginBottom: 3 } }, `模型缩放：${scale}×（尺寸不对就调这里）`),
+            h("div", { style: { display: "flex", gap: 6, alignItems: "center" } },
+                h("input", {
+                    type: "range", min: 0.01, max: 5, step: 0.01, value: scale,
+                    style: { flex: 1 },
+                    onChange: (e) => setScale(Number(e.target.value)),
+                }),
+                h("button", {
+                    type: "button", style: buttonStyle,
+                    onClick: () => {
+                        // 重新注入当前模型（应用新缩放）。
+                        const m = modelInfo;
+                        if (!m) return;
+                        pendingModelRef.current = m;
+                        injectModelIfReady();
+                    },
+                }, "应用"),
+            ),
+        ),
+        modelInfo
+            ? h("div", { style: { fontSize: 11, color: muted } },
+                `模型：${modelInfo.name}（${(modelInfo.size / 1024).toFixed(1)} KB）`,
+                modelInfo.bbox ? h("br") : null,
+                modelInfo.bbox ? `实际尺寸：${modelInfo.bbox.width.toFixed(2)} × ${modelInfo.bbox.height.toFixed(2)} × ${modelInfo.bbox.depth.toFixed(2)} 米` : null,
+            )
+            : null,
         h("div", { style: { fontSize: 11, color: muted, lineHeight: 1.6 } },
             "1. SketchUp「扩展程序 → CanvasSync → 启动服务」",
             h("br"), "2. 本节点「连接 SketchUp」",
