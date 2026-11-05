@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@721a39a63ef5ed75c23180fcf0045a41ded40a1d";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@ff10f8813b5d5a33f22dee1702d7010e62fd1f77";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -93,9 +93,6 @@ function SketchUpSyncContent({ ctx, React }) {
     const [followSu, setFollowSu] = React.useState(false); // 导演台是否跟随 SU 视角（默认关，避免锁死）
     const followRef = React.useRef(false);
     followRef.current = followSu;
-    const [backdropOpacity, setBackdropOpacity] = React.useState(0.45);
-    const backdropOpacityRef = React.useRef(0.45);
-    backdropOpacityRef.current = backdropOpacity;
 
     const ctxRef = React.useRef(ctx);
     ctxRef.current = ctx;
@@ -246,11 +243,7 @@ function SketchUpSyncContent({ ctx, React }) {
         }
         const bd = lastBackdropRef.current;
         if (bd) {
-            sendToDirector("storyai:director-desk-backdrop", {
-                dataUrl: bd,
-                enabled: true,
-                opacity: backdropOpacityRef.current,
-            });
+            sendToDirector("storyai:director-desk-backdrop", { dataUrl: bd, enabled: true });
         }
     };
 
@@ -398,11 +391,7 @@ function SketchUpSyncContent({ ctx, React }) {
                 lastBackdropRef.current = msg.data;
                 // 背景截图（隐藏选中模型）→ 同步到导演台的摄像机视角底图。
                 if (msg.hide_selection === true && directorReadyRef.current) {
-                    sendToDirector("storyai:director-desk-backdrop", {
-                        dataUrl: msg.data,
-                        enabled: true,
-                        opacity: backdropOpacityRef.current,
-                    });
+                    sendToDirector("storyai:director-desk-backdrop", { dataUrl: msg.data, enabled: true });
                 }
                 if (msg.hide_selection !== true) {
                     // 高清导出（含选中模型）→ 回传画布
@@ -549,24 +538,6 @@ function SketchUpSyncContent({ ctx, React }) {
                 "导演台跟随 SU 视角",
             ),
             h("span", { style: { opacity: 0.7 } }, "（导演台转视角会自动回写 SU）"),
-        ),
-        // 底图透明度
-        h("div", { style: { display: "flex", gap: 8, alignItems: "center", fontSize: 11, color: muted } },
-            h("span", null, "导演台底图透明度"),
-            h("input", {
-                type: "range", min: 0.05, max: 1, step: 0.05, value: backdropOpacity,
-                style: { flex: 1 },
-                onChange: (e) => {
-                    const v = Number(e.target.value);
-                    setBackdropOpacity(v);
-                    if (directorReadyRef.current && lastBackdropRef.current) {
-                        sendToDirector("storyai:director-desk-backdrop", {
-                            dataUrl: lastBackdropRef.current, enabled: true, opacity: v,
-                        });
-                    }
-                },
-            }),
-            h("span", null, `${Math.round(backdropOpacity * 100)}%`),
         ),
 
         h("label", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: muted } },
