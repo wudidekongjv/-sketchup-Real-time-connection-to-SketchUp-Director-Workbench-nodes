@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@c855882d0cee0af921cb422a7cb470dd5e2ee079";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@d7c2b7f11f0e4427d380081ab43c089c464fc96f";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -28,7 +28,7 @@ function toCdnPath(p) {
     return `${DIRECTOR_BASE}/${p.replace(/^\/director\//, "").replace(/^\.\//, "")}`;
 }
 
-async function prepareDirectorFrame(hostOrigin) {
+async function prepareDirectorFrame(hostOrigin, instanceId) {
     const html = await fetchText(`${DIRECTOR_BASE}/index.html`);
     const scriptMatch = html.match(/<script[^>]+src=["']([^"']+)["'][^>]*>/i);
     const styleMatch = html.match(/<link[^>]+href=["']([^"']+)["'][^>]*>/i);
@@ -42,10 +42,14 @@ async function prepareDirectorFrame(hostOrigin) {
 
     const styleUrl = styleMatch ? toCdnPath(styleMatch[1]) : null;
     const safe = scriptSource.replace(/<\/script/gi, "<" + String.fromCharCode(92) + "/script");
-    const frameHtml = html
+    // srcdoc 没有 URL 参数，注入全局变量让导演台直接进入指定实例（跳过首页）。
+    const boot = `<script>window.__DIRECTOR_DESK_BOOT__=${JSON.stringify({ instanceId, theme: "dark" })};</script>`;
+
+    let frameHtml = html
         .replace(scriptMatch[0], () => `<script type="module">${safe}</script>`)
         .replace(styleMatch?.[0] || "", () => styleUrl ? `<link rel="stylesheet" href="${styleUrl}">` : "");
 
+    frameHtml = frameHtml.replace(/<head>/i, (m) => `<head>${boot}`);
     return frameHtml;
 }
 
@@ -378,7 +382,8 @@ function SketchUpSyncContent({ ctx, React }) {
         setDirectorStatus("加载中…");
 
         try {
-            const frameHtml = await prepareDirectorFrame(origin);
+            const instanceId = `sketchup-${ctxRef.current.node.id}`;
+            const frameHtml = await prepareDirectorFrame(origin, instanceId);
             // 先清掉可能残留的旧 iframe。
             const stale = document.getElementById(FRAME_ID);
             if (stale) stale.remove();
@@ -537,7 +542,17 @@ function SketchUpSyncContent({ ctx, React }) {
                 setError("导演台 20 秒内未就绪。请检查网络（导演台 JS 约 1.7MB）后重试。");
                 return;
             }
-            // 3) 发送导出请求。
+            // 3) 先强制切到「摄像机视角」并确保有 SK 机位（导出需要活动机位）。
+            const cam = lastCameraRef.current;
+            if (cam?.eye && cam?.target) {
+                sendToDirector("storyai:director-desk-camera", {
+                    eye: cam.eye, target: cam.target, fov: cam.vFov ?? cam.fov, follow: true,
+                });
+                // 给导演台一点时间应用视角。
+                await new Promise((r) => setTimeout(r, 600));
+            }
+
+            // 4) 发送导出请求。
             const requestId = randomId("frame");
             pendingExportRef.current = requestId;
             setStatus("正在导出导演台合成画面（2048）…");
