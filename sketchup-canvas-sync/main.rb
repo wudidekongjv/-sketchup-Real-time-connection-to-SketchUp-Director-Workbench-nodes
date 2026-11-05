@@ -30,7 +30,7 @@ module SketchUpCanvasSync
   @camera_timer_id = nil
   @aspect_w = 16
   @aspect_h = 9
-  @last_model_offset = { cx: 0.0, cz: 0.0, min_y: 0.0 }
+  @last_model_offset = { x: 0.0, y: 0.0, z: 0.0 }
   @last_model_size = { width: 0.0, height: 0.0, depth: 0.0 }
   @last_vertex_count = 0
   @last_raw_range = { xmin: 0.0, xmax: 0.0, ymin: 0.0, ymax: 0.0, zmin: 0.0, zmax: 0.0 }
@@ -217,7 +217,7 @@ module SketchUpCanvasSync
       model = Sketchup.active_model
       return { type: 'camera', error: 'no_model' } unless model
       cam = model.active_view.camera
-      offset = @last_model_offset || { cx: 0.0, cz: 0.0, min_y: 0.0 }
+      offset = @last_model_offset || { x: 0.0, y: 0.0, z: 0.0 }
 
       eye = transform_point(cam.eye, offset)
       target = transform_point(cam.target, offset)
@@ -241,10 +241,11 @@ module SketchUpCanvasSync
     # 把一个 SketchUp 点按「轴转换 + 模型偏移 + 英寸→米」变成 glTF 坐标。
     def transform_point(pt, offset)
       gx, gy, gz = sketchup_to_gltf(pt.x.to_f, pt.y.to_f, pt.z.to_f)
+      # offset 已是米（glTF 坐标），先换算再减。
       [
-        ((gx - offset[:cx]) * INCH_TO_METER).round(4),
-        ((gy - offset[:min_y]) * INCH_TO_METER).round(4),
-        ((gz - offset[:cz]) * INCH_TO_METER).round(4),
+        (gx * INCH_TO_METER - offset[:x]).round(4),
+        (gy * INCH_TO_METER - offset[:y]).round(4),
+        (gz * INCH_TO_METER - offset[:z]).round(4),
       ]
     end
 
@@ -319,6 +320,7 @@ module SketchUpCanvasSync
         size: glb.bytesize,
         data: b64,
         bbox: size_info,
+        offset: @last_model_offset,
         unit: 'meter',
         vertex_count: @last_vertex_count,
       })
@@ -389,8 +391,12 @@ module SketchUpCanvasSync
         positions << z * INCH_TO_METER
       end
 
-      # 偏移量归零（保留原始坐标，不居中）。
-      @last_model_offset = { cx: 0.0, cz: 0.0, min_y: 0.0 }
+      # 偏移量：模型包围盒的 X/Z 中心 + Y 最低点（米）。
+      # 前端用它把「模型 + 相机」一起平移到原点，既保持对齐，又让模型在导演台中心。
+      cx = (xs.min + xs.max) / 2.0 * INCH_TO_METER
+      cy = ys.min * INCH_TO_METER
+      cz = (zs.min + zs.max) / 2.0 * INCH_TO_METER
+      @last_model_offset = { x: cx, y: cy, z: cz }
       @last_model_size = {
         width: (xs.max - xs.min) * INCH_TO_METER,
         height: (ys.max - ys.min) * INCH_TO_METER,

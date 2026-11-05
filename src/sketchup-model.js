@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@55ae2289d1e36202f4b130c1f07ed1086d5cda77";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@0d86b60ab9382bd85735151d84d4183136396930";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -126,6 +126,7 @@ function SketchUpSyncContent({ ctx, React }) {
     const lastModelRef = React.useRef(null);
     const lastCameraRef = React.useRef(null);
     const lastBackdropRef = React.useRef(null);
+    const pendingExportRef = React.useRef(null);
     aspectRef.current = aspect;
     autoSyncRef.current = autoSync;
 
@@ -252,6 +253,7 @@ function SketchUpSyncContent({ ctx, React }) {
                 modelUrl: `data:model/gltf-binary;base64,${m.base64}`,
                 modelFormat: "glb",
                 scale: modelScaleRef.current,
+                offset: m.offset || null,
             });
         }
         const c = lastCameraRef.current;
@@ -295,6 +297,19 @@ function SketchUpSyncContent({ ctx, React }) {
                 loadingDiv.remove();
                 setDirectorStatus("导演台就绪 ✅");
                 pushToDirector();
+            } else if (type === "storyai:director-desk:response") {
+                const p = event.data?.payload;
+                if (p?.action === "export.frame" && p.requestId === pendingExportRef.current) {
+                    pendingExportRef.current = null;
+                    if (p.ok && p.data?.dataUrl) {
+                        exportToCanvas(p.data.dataUrl, p.data.fileName || "导演台合成.png");
+                        setStatus("已回传导演台合成画面到画布");
+                    } else {
+                        setError(`导出失败：${p.error?.message || "未知错误"}`);
+                        setStatus("导出失败");
+                    }
+                    setBusy(false);
+                }
             } else if (type === "storyai:director-desk-captures-sent") {
                 const caps = Array.isArray(event.data?.payload?.captures) ? event.data.payload.captures : [];
                 caps.forEach((cap) => {
@@ -398,6 +413,7 @@ function SketchUpSyncContent({ ctx, React }) {
                     name: msg.name || "SketchUp模型", size: msg.size,
                     bbox: msg.bbox || null, base64: msg.data,
                     vertexCount: msg.vertex_count || 0,
+                    offset: msg.offset || null,
                 };
                 setModelInfo({ name: info.name, size: info.size, bbox: info.bbox });
                 lastModelRef.current = info;
@@ -432,10 +448,28 @@ function SketchUpSyncContent({ ctx, React }) {
     };
 
     // ── 导出高清到画布 ──
+    // 导出 SketchUp 原生截图（只有 SU 场景，不含导演台人物）。
     const exportHighRes = () => {
         if (!connected) { setStatus("请先连接 SketchUp"); return; }
-        setStatus("正在导出高清截图…");
+        setStatus("正在导出 SketchUp 原生截图…");
         requestSnapshot(2048, false, false);
+    };
+
+    // 导出导演台合成画面（底图 + 模型 + 人物），走导演台 export.frame 协议。
+    const exportDirectorFrame = () => {
+        if (!directorReadyRef.current || !frameRef.current) {
+            setStatus("请先打开导演台");
+            return;
+        }
+        const requestId = randomId("frame");
+        pendingExportRef.current = requestId;
+        setBusy(true);
+        setStatus("正在导出导演台合成画面（1080p）…");
+        sendToDirector("storyai:director-desk:request", {
+            requestId,
+            action: "export.frame",
+            options: { fileName: "导演台合成.png", position: "current", quality: "1080p" },
+        });
     };
 
     const exportToCanvas = (dataUrl, fileName) => {
@@ -548,12 +582,13 @@ function SketchUpSyncContent({ ctx, React }) {
         h("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
             h("button", { type: "button", style: primaryStyle, onClick: connect, disabled: connected }, connected ? "已连接" : "连接 SketchUp"),
             h("button", { type: "button", style: buttonStyle, onClick: () => requestSnapshot(640, true, false), disabled: !connected }, "刷新背景"),
-            h("button", { type: "button", style: primaryStyle, onClick: exportHighRes, disabled: !connected || busy }, busy ? "处理中…" : "导出高清(2048)"),
+            h("button", { type: "button", style: buttonStyle, onClick: exportHighRes, disabled: !connected || busy }, "导出 SU 原生图"),
         ),
 
-        // 导演台入口
+        // 导演台入口 + 合成导出
         h("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
             h("button", { type: "button", style: { ...primaryStyle, background: "#7c5cff" }, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "🎬 打开 3D 导演台"),
+            h("button", { type: "button", style: { ...primaryStyle, background: "#2ea043" }, onClick: exportDirectorFrame, disabled: !directorOpen || busy }, busy ? "导出中…" : "导出合成图(1080p)"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
         ),
         // 模型缩放
