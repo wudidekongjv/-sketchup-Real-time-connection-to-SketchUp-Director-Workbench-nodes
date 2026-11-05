@@ -83,6 +83,21 @@ function toVerticalFov(msg, aspectW, aspectH) {
     return safe;
 }
 
+// 模块级持久引用：iframe 挂在 body 上，React 组件重挂载时 state 会丢，
+// 但 DOM 还在。用模块级变量保证「已打开」状态不丢。
+const persistent = {
+    frame: null,
+    ready: false,
+    open: false,
+};
+
+const FRAME_ID = "sketchup-director-frame";
+
+function getLiveFrame() {
+    const el = document.getElementById(FRAME_ID);
+    return el instanceof HTMLIFrameElement ? el : null;
+}
+
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -249,7 +264,8 @@ function SketchUpSyncContent({ ctx, React }) {
 
     // ── 导演台（srcdoc 内联）──
     const sendToDirector = (type, payload) => {
-        frameRef.current?.contentWindow?.postMessage({ type, payload }, window.location.origin);
+        const frame = frameRef.current ?? getLiveFrame() ?? persistent.frame;
+        frame?.contentWindow?.postMessage({ type, payload }, window.location.origin);
     };
 
     const pushToDirector = () => {
@@ -280,6 +296,15 @@ function SketchUpSyncContent({ ctx, React }) {
 
     const openDirector = async () => {
         if (directorOpen) return;
+        // 如果 DOM 里已有导演台（组件重挂载后 state 丢失），只同步状态。
+        const existing = getLiveFrame();
+        if (existing) {
+            frameRef.current = existing;
+            persistent.frame = existing;
+            setDirectorOpen(true);
+            setDirectorStatus("导演台已打开");
+            return;
+        }
         const origin = window.location.origin;
         const overlay = document.createElement("div");
         overlay.style.cssText = "position:fixed;inset:0;z-index:2147483000;background:#090909";
@@ -304,6 +329,7 @@ function SketchUpSyncContent({ ctx, React }) {
             const type = event.data?.type;
             if (type === "storyai:director-desk-ready") {
                 directorReadyRef.current = true;
+                persistent.ready = true;
                 loadingDiv.remove();
                 setDirectorStatus("导演台就绪 ✅");
                 pushToDirector();
@@ -352,12 +378,19 @@ function SketchUpSyncContent({ ctx, React }) {
 
         try {
             const frameHtml = await prepareDirectorFrame(origin);
+            // 先清掉可能残留的旧 iframe。
+            const stale = document.getElementById(FRAME_ID);
+            if (stale) stale.remove();
+
             const frame = document.createElement("iframe");
+            frame.id = FRAME_ID;
             frame.title = "3D导演台";
             frame.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0";
             frame.srcdoc = frameHtml;
             overlay.appendChild(frame);
             frameRef.current = frame;
+            persistent.frame = frame;
+            persistent.open = true;
         } catch (err) {
             loadingDiv.textContent = `导演台加载失败：${err instanceof Error ? err.message : String(err)}`;
             setDirectorStatus("加载失败");
@@ -366,6 +399,9 @@ function SketchUpSyncContent({ ctx, React }) {
 
     const closeDirector = () => {
         directorReadyRef.current = false;
+        persistent.ready = false;
+        persistent.open = false;
+        persistent.frame = null;
         setDirectorOpen(false);
         setDirectorStatus("");
         if (overlayRef.current) {
@@ -469,16 +505,21 @@ function SketchUpSyncContent({ ctx, React }) {
 
     // 导出导演台合成画面（底图 + 模型 + 人物），走导演台 export.frame 协议，2048 宽。
     const exportDirectorFrame = () => {
-        // 无论什么状态，点击都要有反馈。
-        if (!directorOpen) {
+        // 以 DOM 为准判断「是否已打开」（React state 重挂载后会丢）。
+        const liveFrame = getLiveFrame() ?? frameRef.current ?? persistent.frame;
+        const isReady = directorReadyRef.current || persistent.ready;
+        if (!liveFrame) {
             setStatus("请先点「打开 3D 导演台」");
             setError("");
             return;
         }
-        if (!directorReadyRef.current || !frameRef.current) {
+        if (!isReady) {
             setStatus("导演台还在加载，请等 1~2 秒再点");
             return;
         }
+        // 同步本地 ref，保证后续发送可用。
+        frameRef.current = liveFrame;
+        directorReadyRef.current = true;
         const requestId = randomId("frame");
         pendingExportRef.current = requestId;
         setBusy(false);
@@ -552,6 +593,54 @@ function SketchUpSyncContent({ ctx, React }) {
             render();
         }
     });
+
+    // 组件级消息监听：即使 openDirector 的闭包失效，也能收到导演台的导出响应。
+    React.useEffect(() => {
+        const handler = (event) => {
+            const frame = getLiveFrame() ?? frameRef.current ?? persistent.frame;
+            if (!frame || event.source !== frame.contentWindow) return;
+            const type = event.data?.type;
+
+            if (type === "storyai:director-desk-ready") {
+                directorReadyRef.current = true;
+                persistent.ready = true;
+                setDirectorStatus("导演台就绪 ✅");
+                return;
+            }
+
+            if (type === "storyai:director-desk:response") {
+                const p = event.data?.payload;
+                if (p?.action === "export.frame" && p.requestId === pendingExportRef.current) {
+                    pendingExportRef.current = null;
+                    if (exportTimeoutRef.current) {
+                        clearTimeout(exportTimeoutRef.current);
+                        exportTimeoutRef.current = null;
+                    }
+                    if (p.ok && p.data?.dataUrl) {
+                        exportToCanvas(p.data.dataUrl, p.data.fileName || "导演台合成.png");
+                        setStatus("已回传导演台合成画面到画布");
+                        setError("");
+                    } else {
+                        setError(`导出失败：${p.error?.message || "未知错误"}`);
+                        setStatus("导出失败");
+                    }
+                }
+                return;
+            }
+
+            if (type === "storyai:director-desk-captures-sent") {
+                const caps = Array.isArray(event.data?.payload?.captures) ? event.data.payload.captures : [];
+                caps.forEach((cap) => {
+                    if (typeof cap?.dataUrl === "string" && cap.dataUrl.startsWith("data:image/")) {
+                        exportToCanvas(cap.dataUrl, cap.fileName);
+                    }
+                });
+                setDirectorStatus(`已回传 ${caps.length} 张导演台截图`);
+            }
+        };
+        window.addEventListener("message", handler);
+        return () => window.removeEventListener("message", handler);
+    }, []);
 
     React.useEffect(() => {
         connect();
