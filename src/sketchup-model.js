@@ -4,7 +4,8 @@
 // 然后通过 WebSocket 接收 SketchUp 模型，postMessage 注入导演台为 prop。
 
 const WS_URL = "ws://127.0.0.1:8899";
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@main";
+// 用具体 commit 固定，避免 jsDelivr 的 @main 缓存导致拿不到最新版。
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@fbc52b3ad6bb8b02fada1db1535e8a3b9139cc93";
 
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
