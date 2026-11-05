@@ -128,6 +128,7 @@ function SketchUpSyncContent({ ctx, React }) {
     const lastBackdropRef = React.useRef(null);
     const pendingExportRef = React.useRef(null);
     const exportTimeoutRef = React.useRef(null);
+    const snapTimeoutRef = React.useRef(null);
     aspectRef.current = aspect;
     autoSyncRef.current = autoSync;
 
@@ -222,8 +223,16 @@ function SketchUpSyncContent({ ctx, React }) {
     // ── 截图请求（含防抖）──
     const requestSnapshot = (width, hideSelection, silent) => {
         const ws = wsRef.current;
-        if (!ws || ws.readyState !== 1) return;
-        if (!silent) setBusy(true);
+        if (!ws || ws.readyState !== 1) { setStatus("未连接 SketchUp"); return; }
+        if (!silent) {
+            setBusy(true);
+            // 超时保护：8 秒没回来就解除 busy，避免按钮永久禁用。
+            if (snapTimeoutRef.current) clearTimeout(snapTimeoutRef.current);
+            snapTimeoutRef.current = setTimeout(() => {
+                setBusy(false);
+                setStatus("截图超时（SketchUp 可能卡住了）");
+            }, 8000);
+        }
         ws.send(JSON.stringify({ type: "snapshot", width, hide_selection: hideSelection === true }));
     };
 
@@ -429,6 +438,7 @@ function SketchUpSyncContent({ ctx, React }) {
             return;
         }
         if (msg.type === "snapshot") {
+            if (snapTimeoutRef.current) { clearTimeout(snapTimeoutRef.current); snapTimeoutRef.current = null; }
             if (msg.data) {
                 setBackdrop(msg.data);
                 lastBackdropRef.current = msg.data;
@@ -459,14 +469,19 @@ function SketchUpSyncContent({ ctx, React }) {
 
     // 导出导演台合成画面（底图 + 模型 + 人物），走导演台 export.frame 协议，2048 宽。
     const exportDirectorFrame = () => {
-        if (!directorOpen) { setStatus("请先点「打开 3D 导演台」"); setError(""); return; }
+        // 无论什么状态，点击都要有反馈。
+        if (!directorOpen) {
+            setStatus("请先点「打开 3D 导演台」");
+            setError("");
+            return;
+        }
         if (!directorReadyRef.current || !frameRef.current) {
             setStatus("导演台还在加载，请等 1~2 秒再点");
             return;
         }
         const requestId = randomId("frame");
         pendingExportRef.current = requestId;
-        setBusy(true);
+        setBusy(false);
         setError("");
         setStatus("正在导出导演台合成画面（2048）…");
         sendToDirector("storyai:director-desk:request", {
@@ -597,13 +612,13 @@ function SketchUpSyncContent({ ctx, React }) {
         h("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
             h("button", { type: "button", style: primaryStyle, onClick: connect, disabled: connected }, connected ? "已连接" : "连接 SketchUp"),
             h("button", { type: "button", style: buttonStyle, onClick: () => requestSnapshot(640, true, false), disabled: !connected }, "刷新背景"),
-            h("button", { type: "button", style: buttonStyle, onClick: exportHighRes, disabled: !connected || busy }, "导出 SU 原生图"),
+            h("button", { type: "button", style: buttonStyle, onClick: exportHighRes, disabled: !connected }, "导出 SU 原生图"),
         ),
 
         // 导演台入口 + 合成导出
         h("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
             h("button", { type: "button", style: { ...primaryStyle, background: "#7c5cff" }, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "🎬 打开 3D 导演台"),
-            h("button", { type: "button", style: { ...primaryStyle, background: "#2ea043" }, onClick: exportDirectorFrame, disabled: !directorOpen || busy }, busy ? "导出中…" : "导出合成图(2048)"),
+            h("button", { type: "button", style: { ...primaryStyle, background: "#2ea043" }, onClick: exportDirectorFrame }, "导出合成图(2048)"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
         ),
         // 模型缩放
