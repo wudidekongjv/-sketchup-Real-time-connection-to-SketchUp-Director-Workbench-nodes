@@ -301,6 +301,7 @@ function SketchUpSyncContent({ ctx, React }) {
         if (existing) {
             frameRef.current = existing;
             persistent.frame = existing;
+            persistent.ready = true;   // 已存在的 iframe 视为就绪
             setDirectorOpen(true);
             setDirectorStatus("导演台已打开");
             return;
@@ -396,6 +397,22 @@ function SketchUpSyncContent({ ctx, React }) {
             setDirectorStatus("加载失败");
         }
     };
+
+    // 等待导演台就绪（轮询 persistent.ready）。
+    const waitForDirectorReady = (timeoutMs = 20000) =>
+        new Promise((resolve) => {
+            if (persistent.ready || directorReadyRef.current) return resolve(true);
+            const start = Date.now();
+            const timer = setInterval(() => {
+                if (persistent.ready || directorReadyRef.current) {
+                    clearInterval(timer);
+                    resolve(true);
+                } else if (Date.now() - start > timeoutMs) {
+                    clearInterval(timer);
+                    resolve(false);
+                }
+            }, 200);
+        });
 
     const closeDirector = () => {
         directorReadyRef.current = false;
@@ -504,42 +521,43 @@ function SketchUpSyncContent({ ctx, React }) {
     };
 
     // 导出导演台合成画面（底图 + 模型 + 人物），走导演台 export.frame 协议，2048 宽。
-    const exportDirectorFrame = () => {
-        // 以 DOM 为准判断「是否已打开」（React state 重挂载后会丢）。
-        const liveFrame = getLiveFrame() ?? frameRef.current ?? persistent.frame;
-        const isReady = directorReadyRef.current || persistent.ready;
-        if (!liveFrame) {
-            setStatus("请先点「打开 3D 导演台」");
-            setError("");
-            return;
-        }
-        if (!isReady) {
-            setStatus("导演台还在加载，请等 1~2 秒再点");
-            return;
-        }
-        // 同步本地 ref，保证后续发送可用。
-        frameRef.current = liveFrame;
-        directorReadyRef.current = true;
-        const requestId = randomId("frame");
-        pendingExportRef.current = requestId;
-        setBusy(false);
+    const exportDirectorFrame = async () => {
         setError("");
-        setStatus("正在导出导演台合成画面（2048）…");
-        sendToDirector("storyai:director-desk:request", {
-            requestId,
-            action: "export.frame",
-            options: { fileName: "导演台合成.png", position: "current", quality: "2k" },
-        });
-        // 超时保护：20 秒没响应就提示。
-        if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
-        exportTimeoutRef.current = setTimeout(() => {
-            if (pendingExportRef.current === requestId) {
-                pendingExportRef.current = null;
-                setBusy(false);
-                setStatus("导出超时");
-                setError("导演台未在 20 秒内返回画面。请确认：① 导演台处于「摄像机视角」② 场景里已有机位。");
+        try {
+            // 1) 没有导演台就自动打开。
+            if (!getLiveFrame()) {
+                setStatus("正在打开导演台…");
+                await openDirector();
             }
-        }, 20000);
+            // 2) 等就绪。
+            setStatus("等待导演台就绪…");
+            const ready = await waitForDirectorReady(20000);
+            if (!ready) {
+                setStatus("导演台未就绪");
+                setError("导演台 20 秒内未就绪。请检查网络（导演台 JS 约 1.7MB）后重试。");
+                return;
+            }
+            // 3) 发送导出请求。
+            const requestId = randomId("frame");
+            pendingExportRef.current = requestId;
+            setStatus("正在导出导演台合成画面（2048）…");
+            sendToDirector("storyai:director-desk:request", {
+                requestId,
+                action: "export.frame",
+                options: { fileName: "导演台合成.png", position: "current", quality: "2k" },
+            });
+            if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
+            exportTimeoutRef.current = setTimeout(() => {
+                if (pendingExportRef.current === requestId) {
+                    pendingExportRef.current = null;
+                    setStatus("导出超时");
+                    setError("导演台未在 20 秒内返回画面。请确认导演台处于「摄像机视角」且场景里已有机位。");
+                }
+            }, 20000);
+        } catch (err) {
+            setStatus("导出失败");
+            setError(err instanceof Error ? err.message : String(err));
+        }
     };
 
     const exportToCanvas = (dataUrl, fileName) => {
@@ -668,6 +686,8 @@ function SketchUpSyncContent({ ctx, React }) {
             h("span", { style: { fontSize: 14, fontWeight: 600 } }, "SketchUp 同步"),
         ),
         h("div", { style: { fontSize: 12 } }, `状态：${status}`),
+        h("div", { style: { fontSize: 10, color: muted } },
+            `导演台：${getLiveFrame() ? "已打开" : "未打开"} ｜ ${directorStatus || "—"}`),
         error ? h("div", { style: { color: "#ef9a9a", fontSize: 11, whiteSpace: "pre-wrap" } }, error) : null,
 
         // 取景框：底层截图 + 上层 3D 模型
