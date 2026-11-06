@@ -422,12 +422,17 @@ function SketchUpSyncContent({ ctx, React }) {
                     theme: "dark",
                     project: loadSceneForNode(ctxRef.current.node.id),
                 });
-                // 关闭地面网格，让底图画面更接近成品图。
+                // 关闭地面网格/地面，让底图画面更接近成品图。
                 sendToDirector("storyai:director-desk-scene", {
                     showGrid: showGridRef.current,
                     showGround: showGroundRef.current,
                     showLabels: true,
                 });
+                // 强制进入「导演视角」，避免相机被机位锁定（会导致视角回弹）。
+                sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
+                setTimeout(() => {
+                    sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
+                }, 800);
                 pushToDirector();
             } else if (type === "storyai:director-desk:response") {
                 const p = event.data?.payload;
@@ -850,7 +855,12 @@ function SketchUpSyncContent({ ctx, React }) {
             h("button", { type: "button", style: { ...primaryStyle, background: "#2ea043" }, onClick: exportDirectorFrame }, "导出合成图(2048)"),
             h("button", {
                 type: "button", style: buttonStyle,
-                onClick: () => sendToDirector("storyai:director-desk-view-mode", { mode: "director" }),
+                onClick: () => {
+                    sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
+                    setTimeout(() => sendToDirector("storyai:director-desk-view-mode", { mode: "director" }), 120);
+                    setTimeout(() => sendToDirector("storyai:director-desk-view-mode", { mode: "director" }), 400);
+                    setStatus("已请求切换到导演视角");
+                },
             }, "导演视角"),
             h("button", {
                 type: "button", style: buttonStyle,
