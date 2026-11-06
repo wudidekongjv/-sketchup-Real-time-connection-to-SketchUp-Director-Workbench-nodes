@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@ebcb1144ca1102da94853fb9b8fc4c9d3cb7845a";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@fca14225b197eb43386f70a1cb00a2324c6fd947";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -35,9 +35,10 @@ async function prepareDirectorFrame(hostOrigin, instanceId) {
     if (!scriptMatch) throw new Error("导演台缺少脚本入口");
 
     const rawScript = await fetchText(toCdnPath(scriptMatch[1]));
-    // 把 JS 内的 /director/ 路径改写到 CDN，并把 origin 指向宿主。
+    // 严格照抄原插件：只替换「带引号的字符串字面量」"/director/"，
+    // 绝不无条件替换，否则会破坏打包代码里的路径拼接/正则/注释，导致白屏。
     const scriptSource = rawScript
-        .replace(/\/director\//g, `${DIRECTOR_BASE}/`)
+        .replace(/(["'])\/director\//g, (_m, quote) => `${quote}${DIRECTOR_BASE}/`)
         .replace(/window\.location\.origin/g, JSON.stringify(hostOrigin));
 
     const styleUrl = styleMatch ? toCdnPath(styleMatch[1]) : null;
