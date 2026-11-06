@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@997c2028c990429577bf5bfdcd75f7da184cd03c";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@3c716b5ed1e19560a8d13b2688532673178dcfb5";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -577,15 +577,16 @@ function SketchUpSyncContent({ ctx, React }) {
                 setError("导演台 20 秒内未就绪。请检查网络（导演台 JS 约 1.7MB）后重试。");
                 return;
             }
-            // 3) 先强制切到「摄像机视角」并确保有 SK 机位（导出需要活动机位）。
+            // 3) 切到「摄像机视角」并确保有 SK 机位（导出需要活动机位），导出后会切回导演视角。
+            sendToDirector("storyai:director-desk-view-mode", { mode: "camera" });
             const cam = lastCameraRef.current;
             if (cam?.eye && cam?.target) {
                 sendToDirector("storyai:director-desk-camera", {
                     eye: cam.eye, target: cam.target, fov: cam.vFov ?? cam.fov, follow: true,
                 });
-                // 给导演台一点时间应用视角。
-                await new Promise((r) => setTimeout(r, 600));
             }
+            // 给导演台时间应用视角与渲染。
+            await new Promise((r) => setTimeout(r, 900));
 
             // 4) 发送导出请求。
             const requestId = randomId("frame");
@@ -600,6 +601,7 @@ function SketchUpSyncContent({ ctx, React }) {
             exportTimeoutRef.current = setTimeout(() => {
                 if (pendingExportRef.current === requestId) {
                     pendingExportRef.current = null;
+                    sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
                     setStatus("导出超时");
                     setError("导演台未在 20 秒内返回画面。请确认导演台处于「摄像机视角」且场景里已有机位。");
                 }
@@ -684,6 +686,8 @@ function SketchUpSyncContent({ ctx, React }) {
                         clearTimeout(exportTimeoutRef.current);
                         exportTimeoutRef.current = null;
                     }
+                    // 导出完成后切回导演视角，恢复自由操作。
+                    sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
                     if (p.ok && p.data?.dataUrl) {
                         exportToCanvas(p.data.dataUrl, p.data.fileName || "导演台合成.png");
                         setStatus("已回传导演台合成画面到画布");
@@ -786,6 +790,14 @@ function SketchUpSyncContent({ ctx, React }) {
         h("div", { style: { display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" } },
             h("button", { type: "button", style: { ...primaryStyle, background: "#7c5cff" }, onClick: openDirector, disabled: directorOpen }, directorOpen ? "导演台已打开" : "🎬 打开 3D 导演台"),
             h("button", { type: "button", style: { ...primaryStyle, background: "#2ea043" }, onClick: exportDirectorFrame }, "导出合成图(2048)"),
+            h("button", {
+                type: "button", style: buttonStyle,
+                onClick: () => sendToDirector("storyai:director-desk-view-mode", { mode: "director" }),
+            }, "导演视角"),
+            h("button", {
+                type: "button", style: buttonStyle,
+                onClick: () => sendToDirector("storyai:director-desk-view-mode", { mode: "camera" }),
+            }, "摄像机视角"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
         ),
         // 模型缩放
