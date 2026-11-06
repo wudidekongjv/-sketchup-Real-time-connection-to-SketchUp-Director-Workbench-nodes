@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@e91d7410cb30128421db52be69c9ddaa3e72d0ba";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@1f77faa635ec5d97e9cb1978b38d8932c5ccd1b3";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -428,11 +428,6 @@ function SketchUpSyncContent({ ctx, React }) {
                     showGround: showGroundRef.current,
                     showLabels: true,
                 });
-                // 强制进入「导演视角」，避免相机被机位锁定（会导致视角回弹）。
-                sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
-                setTimeout(() => {
-                    sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
-                }, 800);
                 pushToDirector();
             } else if (type === "storyai:director-desk:response") {
                 const p = event.data?.payload;
@@ -857,14 +852,15 @@ function SketchUpSyncContent({ ctx, React }) {
                 type: "button", style: buttonStyle,
                 onClick: () => {
                     sendToDirector("storyai:director-desk-view-mode", { mode: "director" });
-                    setTimeout(() => sendToDirector("storyai:director-desk-view-mode", { mode: "director" }), 120);
-                    setTimeout(() => sendToDirector("storyai:director-desk-view-mode", { mode: "director" }), 400);
-                    setStatus("已请求切换到导演视角");
+                    setStatus("已切换到导演视角");
                 },
             }, "导演视角"),
             h("button", {
                 type: "button", style: buttonStyle,
-                onClick: () => sendToDirector("storyai:director-desk-view-mode", { mode: "camera" }),
+                onClick: () => {
+                    sendToDirector("storyai:director-desk-view-mode", { mode: "camera" });
+                    setStatus("已切换到摄像机视角");
+                },
             }, "摄像机视角"),
             h("button", { type: "button", style: buttonStyle, onClick: syncCameraNow }, "同步 SU 视角"),
             h("button", {
