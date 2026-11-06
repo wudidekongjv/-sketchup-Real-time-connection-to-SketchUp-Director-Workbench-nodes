@@ -128,7 +128,8 @@ function getLiveFrame() {
 
 // 强制移除旧 iframe（含不同版本的）。
 function removeStaleFrames() {
-    document.querySelectorAll(`#${FRAME_ID}, iframe[data-director-version]`).forEach((el) => el.remove());
+    // 只清理导演台自己的 iframe 与 overlay，避免误伤其他 iframe。
+    document.querySelectorAll(`iframe#${FRAME_ID}`).forEach((el) => el.remove());
     const overlay = document.getElementById("sketchup-director-overlay");
     if (overlay) overlay.remove();
 }
@@ -363,7 +364,12 @@ function SketchUpSyncContent({ ctx, React }) {
     };
 
     const openDirector = async () => {
-        if (directorOpen) return;
+        // 兜底：state 认为已打开，但 DOM 里实际没有 → 重置状态并重建。
+        if (directorOpen && !document.getElementById("sketchup-director-overlay")) {
+            setDirectorOpen(false);
+        } else if (directorOpen) {
+            return;
+        }
         // 如果 DOM 里已有导演台（组件重挂载后 state 丢失），只同步状态。
         const existing = getLiveFrame();  // 已含版本校验
         if (existing) {
@@ -470,14 +476,18 @@ function SketchUpSyncContent({ ctx, React }) {
         try {
             const instanceId = `sketchup-${ctxRef.current.node.id}`;
             const frameHtml = await prepareDirectorFrame(origin, instanceId);
-            // 先清掉所有残留 iframe（包括旧版本）。
-            removeStaleFrames();
+            // 只移除可能残留的旧 iframe，绝不能碰刚创建的 overlay。
+            document.querySelectorAll(`iframe#${FRAME_ID}`).forEach((el) => el.remove());
 
             const frame = document.createElement("iframe");
             frame.id = FRAME_ID;
             frame.dataset.directorVersion = DIRECTOR_VERSION;
             frame.title = "3D导演台";
             frame.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0";
+            frame.onerror = () => {
+                loadingDiv.textContent = "导演台 iframe 加载失败";
+                setDirectorStatus("iframe 加载失败");
+            };
             frame.srcdoc = frameHtml;
             overlay.appendChild(frame);
             frameRef.current = frame;
