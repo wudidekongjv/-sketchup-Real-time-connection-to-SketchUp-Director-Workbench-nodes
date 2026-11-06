@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@3c716b5ed1e19560a8d13b2688532673178dcfb5";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@c20ad99c71773227ad7b4e10577f1db97705ac37";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -147,6 +147,9 @@ function SketchUpSyncContent({ ctx, React }) {
     const [reverseSync, setReverseSync] = React.useState(false);
     const reverseRef = React.useRef(false);
     reverseRef.current = reverseSync;
+    const [showGrid, setShowGrid] = React.useState(false);
+    const showGridRef = React.useRef(false);
+    showGridRef.current = showGrid;
     // 模型缩放：默认 1（保持 SketchUp 真实比例）。只有确认比例不符时才手动调整。
     const [modelScale, setModelScale] = React.useState(1);
     const modelScaleRef = React.useRef(1);
@@ -171,6 +174,7 @@ function SketchUpSyncContent({ ctx, React }) {
     const pendingExportRef = React.useRef(null);
     const exportTimeoutRef = React.useRef(null);
     const snapTimeoutRef = React.useRef(null);
+    const camForwardTimerRef = React.useRef(null);
     aspectRef.current = aspect;
     autoSyncRef.current = autoSync;
 
@@ -371,6 +375,8 @@ function SketchUpSyncContent({ ctx, React }) {
                     theme: "dark",
                     project: loadSceneForNode(ctxRef.current.node.id),
                 });
+                // 关闭地面网格，让底图画面更接近成品图。
+                sendToDirector("storyai:director-desk-scene", { showGrid: showGridRef.current });
                 pushToDirector();
             } else if (type === "storyai:director-desk:response") {
                 const p = event.data?.payload;
@@ -502,11 +508,18 @@ function SketchUpSyncContent({ ctx, React }) {
                 setCamera(msg);
                 void applyCamera(msg);
                 scheduleSnapshot();
-                // 转发给导演台（若已打开）：统一用垂直 fov。
+                // 转发给导演台改为「防抖」：SU 停止 700ms 后才发一次，
+                // 避免拖动 SU 视角时每 400ms 打断导演台的操作与选中。
                 if (directorReadyRef.current) {
-                    sendToDirector("storyai:director-desk-camera", {
-                        eye: msg.eye, target: msg.target, fov: normalized.vFov, follow: followRef.current,
-                    });
+                    if (camForwardTimerRef.current) clearTimeout(camForwardTimerRef.current);
+                    camForwardTimerRef.current = setTimeout(() => {
+                        camForwardTimerRef.current = null;
+                        const c = lastCameraRef.current;
+                        if (!c?.eye || !c?.target) return;
+                        sendToDirector("storyai:director-desk-camera", {
+                            eye: c.eye, target: c.target, fov: c.vFov ?? c.fov, follow: false,
+                        });
+                    }, 700);
                 }
             }
             return;
@@ -598,6 +611,7 @@ function SketchUpSyncContent({ ctx, React }) {
                 options: { fileName: "导演台合成.png", position: "current", quality: "2k" },
             });
             if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
+            if (camForwardTimerRef.current) clearTimeout(camForwardTimerRef.current);
             exportTimeoutRef.current = setTimeout(() => {
                 if (pendingExportRef.current === requestId) {
                     pendingExportRef.current = null;
@@ -728,6 +742,7 @@ function SketchUpSyncContent({ ctx, React }) {
             if (wsRef.current) wsRef.current.close();
             if (snapTimerRef.current) clearTimeout(snapTimerRef.current);
             if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
+            if (camForwardTimerRef.current) clearTimeout(camForwardTimerRef.current);
         };
     }, []);
 
@@ -825,6 +840,12 @@ function SketchUpSyncContent({ ctx, React }) {
             h("label", { style: { display: "flex", alignItems: "center", gap: 5 } },
                 h("input", { type: "checkbox", checked: reverseSync, onChange: (e) => setReverseSync(e.target.checked) }),
                 "导演台视角回写 SU（默认关）",
+            ),
+            h("label", { style: { display: "flex", alignItems: "center", gap: 5 } },
+                h("input", {
+                    type: "checkbox", checked: showGrid, onChange: (e) => setShowGrid(e.target.checked),
+                }),
+                "显示地面网格",
             ),
         ),
 
