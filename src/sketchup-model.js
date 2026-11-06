@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@fca14225b197eb43386f70a1cb00a2324c6fd947";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@97d47d849e4034b1428e3888876998fb9bfe8135";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -35,10 +35,11 @@ async function prepareDirectorFrame(hostOrigin, instanceId) {
     if (!scriptMatch) throw new Error("导演台缺少脚本入口");
 
     const rawScript = await fetchText(toCdnPath(scriptMatch[1]));
-    // 严格照抄原插件：只替换「带引号的字符串字面量」"/director/"，
+    // 严格照抄原插件：只替换「引号紧跟 /director/」的字符串字面量，
     // 绝不无条件替换，否则会破坏打包代码里的路径拼接/正则/注释，导致白屏。
+    // 引号集合包含反引号，覆盖模板字符串形式的素材路径（如 `/director/local-assets/...`）。
     const scriptSource = rawScript
-        .replace(/(["'])\/director\//g, (_m, quote) => `${quote}${DIRECTOR_BASE}/`)
+        .replace(/(["'`])\/director\//g, (_m, quote) => `${quote}${DIRECTOR_BASE}/`)
         .replace(/window\.location\.origin/g, JSON.stringify(hostOrigin));
 
     const styleUrl = styleMatch ? toCdnPath(styleMatch[1]) : null;

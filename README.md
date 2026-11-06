@@ -37,7 +37,7 @@ C:\Users\<你的用户名>\AppData\Roaming\SketchUp\SketchUp 2026\SketchUp\Plugi
 在画布右上角「节点插件 → 第三方插件」粘贴：
 
 ```
-https://cdn.jsdelivr.net/gh/wudidekongjv/-@main/dist/sketchup-sync.js
+https://cdn.jsdelivr.net/gh/wudidekongjv/-sketchup-Real-time-connection-to-SketchUp-Director-Workbench-nodes@main/dist/sketchup-model.js
 ```
 
 ### 3. 使用
