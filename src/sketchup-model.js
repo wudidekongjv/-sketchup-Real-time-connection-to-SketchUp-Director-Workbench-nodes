@@ -96,6 +96,8 @@ const persistent = {
 };
 
 const FRAME_ID = "sketchup-director-frame";
+// 导演台版本：随 DIRECTOR_BASE 的 commit 变化，用于检测旧 iframe 并强制重建。
+const DIRECTOR_VERSION = (DIRECTOR_BASE.match(/@([0-9a-f]{7,40})/) || [])[1]?.slice(0, 8) || "dev";
 const SCENE_KEY_PREFIX = "sketchup-director-scene:";
 
 // 场景持久化：按节点 ID 隔离存 localStorage（画布域稳定可用，srcdoc 内不可用）。
@@ -118,7 +120,17 @@ function saveSceneForNode(nodeId, project) {
 
 function getLiveFrame() {
     const el = document.getElementById(FRAME_ID);
-    return el instanceof HTMLIFrameElement ? el : null;
+    if (!(el instanceof HTMLIFrameElement)) return null;
+    // 版本不匹配（导演台已更新）→ 视为失效，需要重建。
+    if (el.dataset.directorVersion !== DIRECTOR_VERSION) return null;
+    return el;
+}
+
+// 强制移除旧 iframe（含不同版本的）。
+function removeStaleFrames() {
+    document.querySelectorAll(`#${FRAME_ID}, iframe[data-director-version]`).forEach((el) => el.remove());
+    const overlay = document.getElementById("sketchup-director-overlay");
+    if (overlay) overlay.remove();
 }
 
 function randomId(prefix) {
@@ -353,17 +365,26 @@ function SketchUpSyncContent({ ctx, React }) {
     const openDirector = async () => {
         if (directorOpen) return;
         // 如果 DOM 里已有导演台（组件重挂载后 state 丢失），只同步状态。
-        const existing = getLiveFrame();
+        const existing = getLiveFrame();  // 已含版本校验
         if (existing) {
             frameRef.current = existing;
             persistent.frame = existing;
-            persistent.ready = true;   // 已存在的 iframe 视为就绪
+            persistent.ready = true;
             setDirectorOpen(true);
-            setDirectorStatus("导演台已打开");
+            setDirectorStatus(`导演台已打开（v${DIRECTOR_VERSION}）`);
+            // 每次复用都重新应用场景设置，确保关闭网格/地面。
+            sendToDirector("storyai:director-desk-scene", {
+                showGrid: showGridRef.current,
+                showGround: showGroundRef.current,
+                showLabels: true,
+            });
             return;
         }
         const origin = window.location.origin;
+        // 先清理可能存在的旧 overlay / iframe（旧版本代码）。
+        removeStaleFrames();
         const overlay = document.createElement("div");
+        overlay.id = "sketchup-director-overlay";
         overlay.style.cssText = "position:fixed;inset:0;z-index:2147483000;background:#090909";
         document.body.appendChild(overlay);
         overlayRef.current = overlay;
@@ -449,12 +470,12 @@ function SketchUpSyncContent({ ctx, React }) {
         try {
             const instanceId = `sketchup-${ctxRef.current.node.id}`;
             const frameHtml = await prepareDirectorFrame(origin, instanceId);
-            // 先清掉可能残留的旧 iframe。
-            const stale = document.getElementById(FRAME_ID);
-            if (stale) stale.remove();
+            // 先清掉所有残留 iframe（包括旧版本）。
+            removeStaleFrames();
 
             const frame = document.createElement("iframe");
             frame.id = FRAME_ID;
+            frame.dataset.directorVersion = DIRECTOR_VERSION;
             frame.title = "3D导演台";
             frame.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0";
             frame.srcdoc = frameHtml;
@@ -776,7 +797,7 @@ function SketchUpSyncContent({ ctx, React }) {
         ),
         h("div", { style: { fontSize: 12 } }, `状态：${status}`),
         h("div", { style: { fontSize: 10, color: muted } },
-            `导演台：${getLiveFrame() ? "已打开" : "未打开"} ｜ ${directorStatus || "—"}`),
+            `导演台：${getLiveFrame() ? "已打开" : "未打开"}（v${DIRECTOR_VERSION}） ｜ ${directorStatus || "—"}`),
         error ? h("div", { style: { color: "#ef9a9a", fontSize: 11, whiteSpace: "pre-wrap" } }, error) : null,
 
         // 取景框：底层截图 + 上层 3D 模型
@@ -826,6 +847,17 @@ function SketchUpSyncContent({ ctx, React }) {
                 onClick: () => sendToDirector("storyai:director-desk-view-mode", { mode: "camera" }),
             }, "摄像机视角"),
             h("button", { type: "button", style: buttonStyle, onClick: syncCameraNow }, "同步 SU 视角"),
+            h("button", {
+                type: "button", style: buttonStyle,
+                onClick: () => {
+                    removeStaleFrames();
+                    frameRef.current = null;
+                    persistent.frame = null;
+                    persistent.ready = false;
+                    setDirectorOpen(false);
+                    setDirectorStatus("已卸载，请重新点「打开 3D 导演台」");
+                },
+            }, "重载导演台"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
         ),
         // 模型缩放
