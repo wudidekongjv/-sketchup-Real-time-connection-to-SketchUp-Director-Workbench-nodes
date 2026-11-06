@@ -11,7 +11,7 @@ const WS_URL = "ws://127.0.0.1:8899";
 const THREE_BASE = "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
 const GLTFLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
 // 改造版 3D 导演台（保留人物/机位/动作，新增 SketchUp 模型注入 + 相机同步协议）。
-const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@c20ad99c71773227ad7b4e10577f1db97705ac37";
+const DIRECTOR_BASE = "https://cdn.jsdelivr.net/gh/wudidekongjv/director-desk@ce23de4769a53701d15ee175eb0b4ba98d5afdce";
 
 // ── 导演台 srcdoc 内联（照 esncy 原插件方式，避免跨域、无需单独部署）──
 function cacheBusted(url) {
@@ -150,6 +150,9 @@ function SketchUpSyncContent({ ctx, React }) {
     const [showGrid, setShowGrid] = React.useState(false);
     const showGridRef = React.useRef(false);
     showGridRef.current = showGrid;
+    const [showGround, setShowGround] = React.useState(false);
+    const showGroundRef = React.useRef(false);
+    showGroundRef.current = showGround;
     // 模型缩放：默认 1（保持 SketchUp 真实比例）。只有确认比例不符时才手动调整。
     const [modelScale, setModelScale] = React.useState(1);
     const modelScaleRef = React.useRef(1);
@@ -298,6 +301,23 @@ function SketchUpSyncContent({ ctx, React }) {
         }, 420);
     };
 
+    // 手动把当前 SU 相机同步到导演台（不自动，避免打断操作）。
+    const syncCameraNow = () => {
+        const c = lastCameraRef.current;
+        if (!c?.eye || !c?.target) {
+            setStatus("还没有收到 SU 相机，请先在 SketchUp 里动一下视角");
+            return;
+        }
+        if (!getLiveFrame()) {
+            setStatus("请先打开导演台");
+            return;
+        }
+        sendToDirector("storyai:director-desk-camera", {
+            eye: c.eye, target: c.target, fov: c.vFov ?? c.fov, follow: false,
+        });
+        setStatus("已同步 SU 视角到导演台");
+    };
+
     // ── 导演台（srcdoc 内联）──
     const sendToDirector = (type, payload) => {
         const frame = frameRef.current ?? getLiveFrame() ?? persistent.frame;
@@ -376,7 +396,11 @@ function SketchUpSyncContent({ ctx, React }) {
                     project: loadSceneForNode(ctxRef.current.node.id),
                 });
                 // 关闭地面网格，让底图画面更接近成品图。
-                sendToDirector("storyai:director-desk-scene", { showGrid: showGridRef.current });
+                sendToDirector("storyai:director-desk-scene", {
+                    showGrid: showGridRef.current,
+                    showGround: showGroundRef.current,
+                    showLabels: true,
+                });
                 pushToDirector();
             } else if (type === "storyai:director-desk:response") {
                 const p = event.data?.payload;
@@ -508,19 +532,7 @@ function SketchUpSyncContent({ ctx, React }) {
                 setCamera(msg);
                 void applyCamera(msg);
                 scheduleSnapshot();
-                // 转发给导演台改为「防抖」：SU 停止 700ms 后才发一次，
-                // 避免拖动 SU 视角时每 400ms 打断导演台的操作与选中。
-                if (directorReadyRef.current) {
-                    if (camForwardTimerRef.current) clearTimeout(camForwardTimerRef.current);
-                    camForwardTimerRef.current = setTimeout(() => {
-                        camForwardTimerRef.current = null;
-                        const c = lastCameraRef.current;
-                        if (!c?.eye || !c?.target) return;
-                        sendToDirector("storyai:director-desk-camera", {
-                            eye: c.eye, target: c.target, fov: c.vFov ?? c.fov, follow: false,
-                        });
-                    }, 700);
-                }
+                // 相机只在「手动同步」时发送，避免自动刷新打断导演台操作。
             }
             return;
         }
@@ -813,6 +825,7 @@ function SketchUpSyncContent({ ctx, React }) {
                 type: "button", style: buttonStyle,
                 onClick: () => sendToDirector("storyai:director-desk-view-mode", { mode: "camera" }),
             }, "摄像机视角"),
+            h("button", { type: "button", style: buttonStyle, onClick: syncCameraNow }, "同步 SU 视角"),
             directorStatus ? h("span", { style: { fontSize: 11, color: muted } }, directorStatus) : null,
         ),
         // 模型缩放
@@ -846,6 +859,18 @@ function SketchUpSyncContent({ ctx, React }) {
                     type: "checkbox", checked: showGrid, onChange: (e) => setShowGrid(e.target.checked),
                 }),
                 "显示地面网格",
+            ),
+            h("label", { style: { display: "flex", alignItems: "center", gap: 5 } },
+                h("input", {
+                    type: "checkbox", checked: showGround,
+                    onChange: (e) => {
+                        setShowGround(e.target.checked);
+                        if (directorReadyRef.current) {
+                            sendToDirector("storyai:director-desk-scene", { showGround: e.target.checked });
+                        }
+                    },
+                }),
+                "显示场景地面",
             ),
         ),
 
